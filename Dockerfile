@@ -1,6 +1,8 @@
 FROM python:3.11-slim
 
-# Install system dependencies required for Playwright / Chromium
+# Force Playwright paths explicitly
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -25,13 +27,13 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install Python requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install browsers globally
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
 COPY . .
 
-# Run the app via Uvicorn
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
