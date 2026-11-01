@@ -1,5 +1,8 @@
 FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
+# Force Playwright to look in the global Microsoft path instead of the user cache
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 WORKDIR /app
 
 COPY requirements.txt .
