@@ -117,13 +117,11 @@ async def discover_product_id(session: AsyncSession) -> str:
         resp = await session.get(SHOP_URL, timeout=6)
         matches = PRODUCT_ID_RE.findall(resp.text)
         for m in matches:
-            # m is a tuple of groups from regex alternation
             for group in m:
                 if group and group.isdigit():
                     return group
     except Exception:
         pass
-    # Fallback default product ID if scraping fails
     return "1234"
 
 
@@ -269,10 +267,8 @@ class WooCommerceChecker:
                     async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
                         bin_task = asyncio.create_task(fetch_bin_metadata(card.number, session))
 
-                        # 1. Discover product ID dynamically
                         prod_id = await discover_product_id(session)
 
-                        # 2. Add product to cart & hit checkout
                         await session.get(CART_URL, timeout=8)
                         await session.get(CART_URL, params={"add-to-cart": prod_id, "quantity": "1"}, timeout=8)
                         
@@ -791,7 +787,7 @@ async def api_mass_stream(cards: str = Form(...), proxies: str = Form(""), threa
                 
                 yield f"data: {json.dumps(data)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms": 0, 'bin_info': {}})}\n\n"
+            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms': 0, 'bin_info': {}})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
