@@ -7,6 +7,7 @@ import random
 import re
 import time
 import os
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/ms-playwright"
 from dataclasses import dataclass, field
 from typing import Any, Final
 from fastapi import FastAPI, Form
