@@ -42,7 +42,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Playwright Diagnostics",
-    version="3.7.0",
+    version="3.8.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -260,22 +260,22 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # Fill Global Payments GP-API fields using sequential keystrokes for SDK detection
+                # Fill Global Payments GP-API fields using sequential keystrokes
                 try:
                     card_filled = False
                     for frame in page.frames:
                         card_input = frame.locator("input[name*='card-number'], input[id*='card-number']").first
                         if await card_input.count() > 0:
                             await card_input.click()
-                            await card_input.press_sequentially(cc, delay=40)
+                            await card_input.press_sequentially(cc, delay=30)
                             
                             expiry_input = frame.locator("input[name*='card-expiry'], input[id*='card-expiry']").first
                             await expiry_input.click()
-                            await expiry_input.press_sequentially(f"{mm}{yy}", delay=40)
+                            await expiry_input.press_sequentially(f"{mm}{yy}", delay=30)
                             
                             cvv_input = frame.locator("input[name*='card-cvc'], input[id*='card-cvc']").first
                             await cvv_input.click()
-                            await cvv_input.press_sequentially(cvv, delay=40)
+                            await cvv_input.press_sequentially(cvv, delay=30)
                             
                             card_filled = True
                             break
@@ -284,12 +284,20 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
                         card_input = page.locator("#globalpayments_gpapi-card-number").first
                         if await card_input.count() > 0:
                             await card_input.click()
-                            await card_input.press_sequentially(cc, delay=40)
-                            await page.locator("#globalpayments_gpapi-card-expiry").first.press_sequentially(f"{mm}{yy}", delay=40)
-                            await page.locator("#globalpayments_gpapi-card-cvc").first.press_sequentially(cvv, delay=40)
+                            await card_input.press_sequentially(cc, delay=30)
+                            await page.locator("#globalpayments_gpapi-card-expiry").first.press_sequentially(f"{mm}{yy}", delay=30)
+                            await page.locator("#globalpayments_gpapi-card-cvc").first.press_sequentially(cvv, delay=30)
 
-                    # Allow SDK time to bind key events and mint the secure payment token
-                    await page.wait_for_timeout(4000)
+                    # Wait for SDK token generation and inspect form token fields
+                    await page.wait_for_timeout(3500)
+                    
+                    token_debug = await page.evaluate("""() => {
+                        const tokens = Array.from(document.querySelectorAll('input[name*="token"], input[id*="token"], input[name*="gp-api"]'))
+                            .map(el => ({name: el.name, id: el.id, value: el.value ? el.value.substring(0, 10) + '...' : 'empty'}));
+                        return tokens;
+                    }""")
+                    logger.info(f"Discovered payment tokens/hidden fields: {token_debug}")
+
                 except Exception as fill_err:
                     logger.warning(f"Card keystroke input failed: {fill_err}")
 
@@ -373,7 +381,7 @@ async def index() -> HTMLResponse:
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes automated inspection with sequential keystroke simulation for SDK token binding.
+                    Executes automated inspection with token debugging & validation checks.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
@@ -399,7 +407,7 @@ Ready for Playwright browser inspection...
 
             button.disabled = true;
             button.textContent = "Running inspection...";
-            output.textContent = "Simulating keystrokes & tokenizing card...";
+            output.textContent = "Processing checkout workflow & token debugging...";
 
             try {
                 let url = "/api/diagnostics/checkout";
