@@ -42,7 +42,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Playwright Diagnostics",
-    version="3.4.0",
+    version="3.5.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -243,7 +243,7 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             await page.fill("#billing_phone", billing["phone"])
             await page.fill("#billing_email", billing["email"])
 
-            # Fill Shipping Details (to satisfy ship-to-different-address requirements)
+            # Fill Shipping Details
             try:
                 ship_diff = page.locator("#ship-to-different-address-checkbox")
                 if await ship_diff.count() > 0 and not await ship_diff.is_checked():
@@ -260,13 +260,16 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # Fill Global Payments GP-API fields
+                # Fill Global Payments GP-API fields and wait for tokenization
                 try:
                     card_input = page.locator("#globalpayments_gpapi-card-number, input[name*='card-number']").first
                     if await card_input.count() > 0:
                         await card_input.fill(cc)
                         await page.locator("#globalpayments_gpapi-card-expiry, input[name*='card-expiry']").first.fill(f"{mm} / {yy}")
                         await page.locator("#globalpayments_gpapi-card-cvc, input[name*='card-cvc']").first.fill(cvv)
+                        
+                        # Allow SDK time to generate secure payment token
+                        await page.wait_for_timeout(2000)
                 except Exception as fill_err:
                     logger.warning(f"Card field fill encountered issue: {fill_err}")
 
@@ -291,7 +294,7 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
 
                 page.on("response", handle_response)
 
-                # Click Place Order using force-click or JS evaluation
+                # Click Place Order
                 place_order_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order'], .place-order button").first
                 if await place_order_btn.count() > 0:
                     try:
@@ -350,7 +353,7 @@ async def index() -> HTMLResponse:
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes automated inspection with billing and shipping address synchronization.
+                    Executes automated inspection with tokenization wait time.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
@@ -376,7 +379,7 @@ Ready for Playwright browser inspection...
 
             button.disabled = true;
             button.textContent = "Running inspection...";
-            output.textContent = "Processing checkout workflow with billing & shipping...";
+            output.textContent = "Processing checkout & tokenizing card...";
 
             try {
                 let url = "/api/diagnostics/checkout";
