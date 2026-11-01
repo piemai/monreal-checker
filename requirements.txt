@@ -1,4 +1,4 @@
 fastapi
 uvicorn
-curl_cffi
 python-multipart
+curl_cffi
