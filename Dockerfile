@@ -1,6 +1,6 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# Install minimal OS dependencies required for Chromium/Playwright
+# Install system dependencies required for Chromium/Playwright
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -27,11 +27,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Force pip to use pre-built wheels only, completely avoiding wheel builds
-RUN pip install --no-cache-dir --only-binary=:all: -r requirements.txt
-
-# Install Playwright browser binary
+# Install Playwright browser binary and OS dependencies
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
