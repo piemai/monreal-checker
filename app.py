@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs
 
-# Persistent browser path for Render; ignored locally if overridden
+# Persistent browser path for Render; ignored locally on Windows or when LOCAL_DEV=1
 if os.name != "nt" and not os.getenv("LOCAL_DEV"):
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.ms-playwright")
 
@@ -30,7 +30,7 @@ CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
 SHOP_URL = f"{TARGET_BASE}/shop/"
 AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
-# Set HEADLESS=0 locally on Windows to pass GP-API canvas/WebGL fingerprinting
+# Set HEADLESS=0 locally on Windows to expose real WebGL/canvas for GP-API fingerprinting
 HEADLESS_MODE = os.getenv("HEADLESS", "1") != "0"
 
 logging.basicConfig(
@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal Hybrid Checkout Engine", version="4.0.0")
+app = FastAPI(title="Monreal Hybrid Checkout Engine", version="4.1.0")
 
 
 # ============================================================
@@ -215,7 +215,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
         seeded_cookies = await seed_cart_fast(http_session)
 
     async with async_playwright() as p:
-        # Avoid --headless=new when HEADLESS_MODE is False so full GPU/WebGL context loads
         browser_args = [
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -240,7 +239,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
             ),
         )
 
-        # Strip webdriver flag before any GP-API script runs
+        # Strip webdriver flag before GP-API scripts initialize
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
@@ -258,10 +257,9 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
         response_reason = "Checkout session prepared"
         gateway_name = "globalpayments_gpapi"
         captured_token: str | None = None
-        intercepted_post_data: dict[str, list[str]] = {}
 
         try:
-            # Fallback shop click if HTTP cart seed didn't catch a valid product
+            # Fallback shop click if HTTP cart seed missed
             if not seeded_cookies:
                 await page.goto(SHOP_URL, timeout=12000, wait_until="domcontentloaded")
                 add_btn = page.locator(".add_to_cart_button, .product_type_simple").first
@@ -283,50 +281,61 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
             await page.fill("#billing_phone", billing["phone"])
             await page.fill("#billing_email", billing["email"])
 
-            # Uncheck ship-to-different-address so WooCommerce copies billing -> shipping cleanly
+            # Also populate shipping fields directly if present
             try:
                 ship_diff = page.locator("#ship-to-different-address-checkbox")
                 if await ship_diff.count() > 0 and await ship_diff.is_checked():
                     await ship_diff.uncheck(force=True)
+                if await page.locator("#shipping_first_name").is_visible():
+                    await page.fill("#shipping_first_name", billing["first_name"])
+                    await page.fill("#shipping_last_name", billing["last_name"])
+                    await page.fill("#shipping_address_1", billing["address_1"])
+                    await page.fill("#shipping_city", billing["city"])
+                    await page.fill("#shipping_postcode", billing["postcode"])
             except Exception:
                 pass
 
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # Wait specifically for Global Payments secure iframes to mount
-                await page.wait_for_Selector("iframe[id*='globalpayments'], iframe[src*='globalpayments']", timeout=10000)
+                # Wait for Global Payments secure iframes to mount (fixed lowercase wait_for_selector)
+                try:
+                    await page.wait_for_selector(
+                        "iframe[id*='globalpayments'], iframe[src*='globalpayments'], iframe[name*='globalpayments']",
+                        timeout=10000,
+                    )
+                except Exception as wait_err:
+                    logger.warning(f"GP-API iframe wait warning: {wait_err}")
 
+                # Allow internal iframe inputs to finish rendering
+                await page.wait_for_timeout(1500)
+
+                # Fill separated GP-API iframes (card-number, card-expiration, card-cvv)
                 for frame in page.frames:
-                    f_url = frame.url.lower()
-                    if "globalpayments" not in f_url and "gpapi" not in f_url and frame == page.main_frame:
+                    if frame == page.main_frame:
                         continue
+                    try:
+                        frame_el = await frame.frame_element()
+                        frame_id = (await frame_el.get_attribute("id") or "").lower()
+                        frame_name = (await frame_el.get_attribute("name") or "").lower()
+                        parent_id = await frame_el.evaluate("el => el.parentElement ? el.parentElement.id.toLowerCase() : ''")
+                        ident = f"{frame_id} {frame_name} {parent_id}"
 
-                    cc_loc = frame.locator("input[id*='card-number'], input[name*='card-number'], input[type='tel']").first
-                    if await cc_loc.count() > 0:
-                        exp_loc = frame.locator("input[id*='card-expiration'], input[id*='card-expiry'], input[name*='expiry']").first
-                        cvv_loc = frame.locator("input[id*='card-cvv'], input[id*='card-cvc'], input[name*='cvc']").first
+                        inp = frame.locator("input[type='tel'], input[type='text'], input:not([type='hidden'])").first
+                        if await inp.count() == 0:
+                            continue
 
-                        if await exp_loc.count() == 0 and await cvv_loc.count() == 0:
-                            # GP-API uses separate single-input iframes per field (number, expiration, cvv, submit)
-                            fname_attr = (await frame.frame_element()).get_attribute("id") or ""
-                            fname_str = (await fname_attr) if asyncio.iscoroutine(fname_attr) else str(fname_attr)
-                            if "number" in fname_str.lower():
-                                await cc_loc.click()
-                                await cc_loc.press_sequentially(cc, delay=35)
-                            elif "expir" in fname_str.lower():
-                                await cc_loc.click()
-                                await cc_loc.press_sequentially(f"{mm}{yy}", delay=35)
-                            elif "cvv" in fname_str.lower() or "cvc" in fname_str.lower():
-                                await cc_loc.click()
-                                await cc_loc.press_sequentially(cvv, delay=35)
-                        else:
-                            await cc_loc.click()
-                            await cc_loc.press_sequentially(cc, delay=35)
-                            await exp_loc.click()
-                            await exp_loc.press_sequentially(f"{mm}{yy}", delay=35)
-                            await cvv_loc.click()
-                            await cvv_loc.press_sequentially(cvv, delay=35)
+                        if "number" in ident:
+                            await inp.click()
+                            await inp.press_sequentially(cc, delay=30)
+                        elif "expir" in ident:
+                            await inp.click()
+                            await inp.press_sequentially(f"{mm}{yy}", delay=30)
+                        elif "cvv" in ident or "cvc" in ident or "security" in ident:
+                            await inp.click()
+                            await inp.press_sequentially(cvv, delay=30)
+                    except Exception as f_err:
+                        logger.debug(f"Frame inspect skip: {f_err}")
 
                 # Check Terms & Conditions
                 try:
@@ -338,18 +347,16 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
 
                 # Hook network to capture both GP-API token response and WooCommerce AJAX checkout
                 async def on_request(req: Request):
-                    nonlocal intercepted_post_data, captured_token
+                    nonlocal captured_token
                     if "wc-ajax=checkout" in req.url and req.method == "POST" and req.post_data:
                         parsed_qs = parse_qs(req.post_data)
-                        intercepted_post_data = parsed_qs
                         for k, v in parsed_qs.items():
-                            if "token" in k.lower() and v:
-                                captured_token = v[0][:40]
+                            if "token" in k.lower() and v and v[0]:
+                                captured_token = v[0][:48]
 
                 async def on_response(resp):
                     nonlocal response_status, response_reason, captured_token
-                    # Catch direct GP-API token minting from apis.globalpay.com
-                    if "globalpay" in resp.url and resp.request.method == "POST":
+                    if ("globalpay" in resp.url or "gpapi" in resp.url) and resp.request.method == "POST":
                         try:
                             gp_json = await resp.json()
                             if isinstance(gp_json, dict) and "id" in gp_json:
@@ -360,30 +367,38 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         try:
                             body = await resp.text()
                             if "result" in body or "messages" in body:
-                                response_status, response_reason = inspect_checkout_response(body)
+                                status_cand, reason_cand = inspect_checkout_response(body)
+                                response_status = status_cand
+                                response_reason = reason_cand
                         except Exception:
                             pass
 
                 page.on("request", on_request)
                 page.on("response", on_response)
 
-                # GP-API WooCommerce plugin requires clicking EITHER the hidden iframe submit button OR #place_order
-                # so the SDK intercepts the submit event, calls GlobalPayments.creditCard.form.submit(), mints the token,
-                # and only then submits the WooCommerce form.
-                place_order_btn = page.locator("#place_order").first
-                await place_order_btn.dispatch_event("click")
+                # Click #place_order so GP-API runs Pass 1 (`globalpayments_gpapi_checkout_validated`),
+                # then automatically triggers its hidden submit iframe to tokenize and fire Pass 2
+                place_order_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order']").first
+                if await place_order_btn.count() > 0:
+                    await place_order_btn.click(force=True)
 
-                # Wait up to 8 seconds for GP-API token handshake + second-pass wc-ajax=checkout response
-                for _ in range(16):
+                # Poll up to 12 seconds for Pass 2 (past `globalpayments_gpapi_checkout_validated`)
+                for step in range(24):
                     await page.wait_for_timeout(500)
+                    # If Pass 1 validated, ensure GP-API's submit iframe button isn't stuck waiting for a click
+                    if step == 6 and response_reason == "globalpayments_gpapi_checkout_validated" and not captured_token:
+                        for frame in page.frames:
+                            try:
+                                frame_el = await frame.frame_element()
+                                parent_id = await frame_el.evaluate("el => el.parentElement ? el.parentElement.id.toLowerCase() : ''")
+                                if "submit" in parent_id:
+                                    btn = frame.locator("button, input[type='button'], input[type='submit']").first
+                                    if await btn.count() > 0:
+                                        await btn.click(force=True)
+                            except Exception:
+                                pass
                     if response_status != "CHECKOUT_READY" and response_reason != "globalpayments_gpapi_checkout_validated":
                         break
-
-                # If WooCommerce returned `globalpayments_gpapi_checkout_validated`, that is GP-API's FIRST-PASS
-                # validation hook! The plugin validates billing fields first via AJAX, and on success triggers
-                # client-side tokenization and automatically submits the form a SECOND time with the minted token.
-                if response_reason == "globalpayments_gpapi_checkout_validated":
-                    await page.wait_for_timeout(5000)
 
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -431,10 +446,10 @@ async def index() -> HTMLResponse:
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Two-Pass Inspector</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Two-Pass Inspector v4.1</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Handles GP-API two-stage validation (`globalpayments_gpapi_checkout_validated` -> token mint -> final charge).
+                    Maps separated GP-API iframes by parent container ID, captures token minting, and waits past Pass-1 validation.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -457,7 +472,7 @@ async def index() -> HTMLResponse:
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
             button.textContent = "Executing two-pass GP-API flow...";
-            output.textContent = "Seeding cart, filling multi-iframe GP-API fields, waiting for 2nd-pass charge...";
+            output.textContent = "Seeding cart, typing into isolated GP-API iframes, awaiting Pass-2 gateway verdict...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
