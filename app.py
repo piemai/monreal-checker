@@ -5,12 +5,14 @@ import asyncio
 import json
 import logging
 import os
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/render/project/src/.ms-playwright"
 import random
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+# Ensure Playwright browser binaries use a persistent writable path on Render
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/render/project/src/.ms-playwright"
 
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
@@ -40,7 +42,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Playwright Diagnostics",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -243,18 +245,15 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # Try filling GP-API fields directly or inside frames
+                # Fill Global Payments GP-API fields
                 try:
-                    # Target potential Global Payments GP-API input IDs/names
                     card_input = page.locator("#globalpayments_gpapi-card-number, input[name*='card-number']").first
                     if await card_input.count() > 0:
                         await card_input.fill(cc)
                         await page.locator("#globalpayments_gpapi-card-expiry, input[name*='card-expiry']").first.fill(f"{mm} / {yy}")
                         await page.locator("#globalpayments_gpapi-card-cvc, input[name*='card-cvc']").first.fill(cvv)
                     else:
-                        # Fallback to frame-based inputs if hosted iframe
-                        frames = page.frames
-                        for frame in frames:
+                        for frame in page.frames:
                             frame_input = frame.locator("input[name*='card'], input[id*='card']").first
                             if await frame_input.count() > 0:
                                 await frame_input.fill(cc)
@@ -262,13 +261,21 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
                 except Exception as fill_err:
                     logger.warning(f"Card field fill encountered issue: {fill_err}")
 
+                # 3. Check Terms & Conditions checkbox to enable order placement
+                try:
+                    terms_box = page.locator("#terms, input[name='terms']")
+                    if await terms_box.count() > 0:
+                        await terms_box.check(force=True)
+                except Exception:
+                    pass
+
                 # Intercept wc-ajax checkout response
                 async def handle_response(response):
                     nonlocal response_status, response_reason
                     if "?wc-ajax=checkout" in response.url or "checkout" in response.url:
                         try:
                             body = await response.text()
-                            if "result" in body:
+                            if "result" in body or "messages" in body:
                                 response_status, response_reason = inspect_checkout_response(body)
                         except Exception:
                             pass
@@ -276,10 +283,10 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
                 page.on("response", handle_response)
 
                 # Click Place Order
-                place_order_btn = page.locator("#place_order")
-                if await place_order_btn.count() > 0:
-                    await place_order_btn.click()
-                    await page.wait_for_timeout(5000)
+                place_order_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order'], .place-order button").first
+                await place_order_btn.scroll_into_view_if_needed()
+                await place_order_btn.click(timeout=10000)
+                await page.wait_for_timeout(6000)
             
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -330,7 +337,7 @@ async def index() -> HTMLResponse:
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes headless browser automation with JavaScript tokenization support.
+                    Executes headless browser automation with JavaScript tokenization & terms acceptance.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
@@ -356,7 +363,7 @@ Ready for Playwright browser inspection...
 
             button.disabled = true;
             button.textContent = "Launching browser & inspecting...";
-            output.textContent = "Spinning up headless browser, adding to cart, and executing workflow...";
+            output.textContent = "Spinning up browser, adding to cart, accepting terms, and executing workflow...";
 
             try {
                 let url = "/api/diagnostics/checkout";
