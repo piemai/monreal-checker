@@ -29,7 +29,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browser binary and OS dependencies
+# Install Playwright browser binary and OS dependencies normally
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
