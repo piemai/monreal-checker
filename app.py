@@ -385,7 +385,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
-                # Populate both standard top-level and plugin-specific nested gateway inputs
                 if captured_token:
                     dom_form_data = await page.evaluate("""(tokenStr) => {
                         const form = document.querySelector('form.checkout');
@@ -397,7 +396,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         let pm = form.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
                         if (pm) pm.checked = true;
 
-                        // Set all possible variants of token input names used by GP-API WooCommerce plugin
                         const fieldNames = [
                             'globalpayments_gpapi-token_response',
                             'globalpayments_gpapi_token',
