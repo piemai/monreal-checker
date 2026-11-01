@@ -27,7 +27,6 @@ TARGET_BASE = os.getenv(
 CHECKOUT_PATH = "/checkout/"
 SHOP_PATH = "/shop/"
 CART_PATH = "/cart/"
-PAYMENT_GATEWAY_SLUG = "globalpayments_credit_card"
 HEALTH_TIMEOUT = 10
 
 logging.basicConfig(
@@ -39,7 +38,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Checkout Diagnostics",
-    version="2.3.1",
+    version="2.4.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -71,6 +70,7 @@ class DiagnosticResult:
     http_status: int | None = None
     latency_ms: float = 0.0
     bin_info: dict[str, str] = field(default_factory=dict)
+    gateway_used: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +79,7 @@ class DiagnosticResult:
             "http_status": self.http_status,
             "latency_ms": round(self.latency_ms, 2),
             "bin_info": self.bin_info,
+            "gateway_used": self.gateway_used,
         }
 
 
@@ -180,7 +181,6 @@ class BillingProfile:
         }
 
 
-
 # ============================================================
 # RESPONSE DIAGNOSTIC CLASSIFIER
 # ============================================================
@@ -243,16 +243,26 @@ async def inspect_checkout_session(card_line: str | None = None) -> DiagnosticRe
             await session.get(CART_URL, timeout=8)
             await session.get(CART_URL, params={"add-to-cart": prod_id, "quantity": "1"}, timeout=8)
 
-            # 2. Load Checkout page for Nonce
+            # 2. Load Checkout page for Nonce & Payment Methods
             response = await session.get(CHECKOUT_URL, timeout=HEALTH_TIMEOUT)
             elapsed = (time.perf_counter() - started) * 1000
 
             if response.status_code != 200:
                 return DiagnosticResult(status="HTTP_ERROR", reason=f"Checkout endpoint returned HTTP {response.status_code}", http_status=response.status_code, latency_ms=elapsed)
 
-            nonce_match = NONCE_RE.search(response.text)
+            checkout_html = response.text
+
+            # Dynamically discover available payment gateway slug(s)
+            gateway_matches = re.findall(r'name=["\']payment_method["\'][^>]*value=["\']([^"\']+)["\']', checkout_html, re.IGNORECASE)
+            if not gateway_matches:
+                # Fallback check for radio inputs or IDs
+                gateway_matches = re.findall(r'id=["\']payment_method_([^"\']+)["\']', checkout_html, re.IGNORECASE)
+            
+            payment_gateway_slug = gateway_matches[0] if gateway_matches else "globalpayments_gpapi"
+
+            nonce_match = NONCE_RE.search(checkout_html)
             if not nonce_match:
-                return DiagnosticResult(status="SESSION_ERROR", reason="Checkout loaded but process nonce was not detected", http_status=response.status_code, latency_ms=elapsed)
+                return DiagnosticResult(status="SESSION_ERROR", reason="Checkout loaded but process nonce was not detected", http_status=response.status_code, latency_ms=elapsed, gateway_used=payment_gateway_slug)
 
             nonce = nonce_match.group(1) or nonce_match.group(2) or nonce_match.group(3) or nonce_match.group(4)
 
@@ -262,18 +272,18 @@ async def inspect_checkout_session(card_line: str | None = None) -> DiagnosticRe
                 cc, mm, yy, cvv = parsed_card
                 billing = BillingProfile.generate()
 
-                # 3. Submit Checkout Payload
+                # 3. Submit Checkout Payload using discovered gateway slug
                 form_data = {
                     **billing,
                     "order_comments": "",
-                    "payment_method": PAYMENT_GATEWAY_SLUG,
+                    "payment_method": payment_gateway_slug,
                     "woocommerce-process-checkout-nonce": nonce,
                     "_wp_http_referer": CHECKOUT_PATH,
                     "terms": "on",
                     "terms-field": "1",
-                    "globalpayments_credit_card-card-number": cc,
-                    "globalpayments_credit_card-card-expiry": f"{mm} / {yy}",
-                    "globalpayments_credit_card-card-cvc": cvv,
+                    f"{payment_gateway_slug}-card-number": cc,
+                    f"{payment_gateway_slug}-card-expiry": f"{mm} / {yy}",
+                    f"{payment_gateway_slug}-card-cvc": cvv,
                 }
 
                 post_resp = await session.post(
@@ -290,10 +300,11 @@ async def inspect_checkout_session(card_line: str | None = None) -> DiagnosticRe
                     reason=reason,
                     http_status=post_resp.status_code,
                     latency_ms=elapsed,
-                    bin_info=bin_info
+                    bin_info=bin_info,
+                    gateway_used=payment_gateway_slug
                 )
 
-            return DiagnosticResult(status="CHECKOUT_READY", reason="Active session seeded, checkout page and process nonce detected successfully", http_status=response.status_code, latency_ms=elapsed)
+            return DiagnosticResult(status="CHECKOUT_READY", reason=f"Active session seeded. Discovered Gateway: {payment_gateway_slug}", http_status=response.status_code, latency_ms=elapsed, gateway_used=payment_gateway_slug)
 
     except Exception as exc:
         elapsed = (time.perf_counter() - started) * 1000
@@ -323,7 +334,7 @@ async def index() -> HTMLResponse:
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Test checkout session seeding, nonces, and card submission parsing.
+                    Test checkout session seeding, nonces, and dynamic gateway discovery.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
@@ -349,7 +360,7 @@ Ready for inspection...
 
             button.disabled = true;
             button.textContent = "Running inspection...";
-            output.textContent = "Seeding session and testing checkout workflow...";
+            output.textContent = "Discovering active payment gateway and testing workflow...";
 
             try {
                 let url = "/api/diagnostics/checkout";
@@ -381,8 +392,9 @@ async def health() -> dict[str, str]:
 async def checkout_diagnostics(card: str | None = None) -> dict[str, Any]:
     result = await inspect_checkout_session(card_line=card)
     logger.info(
-        "Checkout diagnostic status=%s http=%s latency=%.2fms",
+        "Checkout diagnostic status=%s gateway=%s http=%s latency=%.2fms",
         result.status,
+        result.gateway_used,
         result.http_status,
         result.latency_ms,
     )
