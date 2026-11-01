@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -38,7 +39,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Checkout Diagnostics",
-    version="2.3.0",
+    version="2.3.1",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
