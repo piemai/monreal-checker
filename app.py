@@ -163,7 +163,7 @@ class PlaywrightChecker:
                 ]
 
                 try:
-                    # Launch using Playwright's native built-in browser manager
+                    # Clean default browser launch using Playwright's native path resolution
                     browser = await p.chromium.launch(args=browser_args)
                 except Exception as launch_err:
                     return CheckResult(
