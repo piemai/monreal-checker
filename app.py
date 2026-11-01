@@ -69,7 +69,7 @@ class DiagnosticResult:
     reason: str
     http_status: int | None = None
     latency_ms: float = 0.0
-    bin_info: dict[str, str] = field(default_factory=dict) if "field" in globals() else {}
+    bin_info: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,8 +77,9 @@ class DiagnosticResult:
             "reason": self.reason,
             "http_status": self.http_status,
             "latency_ms": round(self.latency_ms, 2),
-            "bin_info": getattr(self, "bin_info", {}),
+            "bin_info": self.bin_info,
         }
+
 
 
 # ============================================================
