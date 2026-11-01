@@ -38,7 +38,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Checkout Diagnostics",
-    version="2.2.0",
+    version="2.3.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -79,7 +79,6 @@ class DiagnosticResult:
             "latency_ms": round(self.latency_ms, 2),
             "bin_info": self.bin_info,
         }
-
 
 
 # ============================================================
@@ -230,6 +229,8 @@ async def inspect_checkout_session(card_line: str | None = None) -> DiagnosticRe
                     elapsed = (time.perf_counter() - started) * 1000
                     return DiagnosticResult(status="CHECKOUT_ERROR", reason="Invalid card format or failed Luhn check", latency_ms=elapsed)
                 bin_task = asyncio.create_task(fetch_bin_metadata(parsed_card[0], session))
+            else:
+                bin_task = None
 
             # 1. Discover product & seed cart
             prod_id = await discover_product_id(session)
@@ -250,7 +251,8 @@ async def inspect_checkout_session(card_line: str | None = None) -> DiagnosticRe
             nonce = nonce_match.group(1) or nonce_match.group(2) or nonce_match.group(3) or nonce_match.group(4)
 
             if card_line and parsed_card:
-                bin_info = await bin_task
+                if bin_task:
+                    bin_info = await bin_task
                 cc, mm, yy, cvv = parsed_card
                 billing = BillingProfile.generate()
 
@@ -277,16 +279,20 @@ async def inspect_checkout_session(card_line: str | None = None) -> DiagnosticRe
                 elapsed = (time.perf_counter() - started) * 1000
                 status, reason = inspect_checkout_response(post_resp.status_code, post_resp.text)
                 
-                res = DiagnosticResult(status=status, reason=reason, http_status=post_resp.status_code, latency_ms=elapsed)
-                res.bin_info = bin_info
-                return res
+                return DiagnosticResult(
+                    status=status,
+                    reason=reason,
+                    http_status=post_resp.status_code,
+                    latency_ms=elapsed,
+                    bin_info=bin_info
+                )
 
             return DiagnosticResult(status="CHECKOUT_READY", reason="Active session seeded, checkout page and process nonce detected successfully", http_status=response.status_code, latency_ms=elapsed)
 
     except Exception as exc:
         elapsed = (time.perf_counter() - started) * 1000
         logger.exception("Checkout session diagnostic failed")
-        return DiagnosticResult(status="NETWORK_ERROR", reason=type(exc).__name__, latency_ms=elapsed)
+        return DiagnosticResult(status="NETWORK_ERROR", reason=f"{type(exc).__name__}: {str(exc)[:100]}", latency_ms=elapsed)
 
 
 # ============================================================
