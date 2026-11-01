@@ -42,7 +42,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Playwright Diagnostics",
-    version="3.3.0",
+    version="3.4.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -234,6 +234,7 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             await page.wait_for_selector("#billing_first_name", timeout=8000)
 
             billing = BillingProfile.generate()
+            # Fill Billing Details
             await page.fill("#billing_first_name", billing["first_name"])
             await page.fill("#billing_last_name", billing["last_name"])
             await page.fill("#billing_address_1", billing["address_1"])
@@ -241,6 +242,20 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             await page.fill("#billing_postcode", billing["postcode"])
             await page.fill("#billing_phone", billing["phone"])
             await page.fill("#billing_email", billing["email"])
+
+            # Fill Shipping Details (to satisfy ship-to-different-address requirements)
+            try:
+                ship_diff = page.locator("#ship-to-different-address-checkbox")
+                if await ship_diff.count() > 0 and not await ship_diff.is_checked():
+                    await ship_diff.check(force=True)
+
+                await page.fill("#shipping_first_name", billing["first_name"])
+                await page.fill("#shipping_last_name", billing["last_name"])
+                await page.fill("#shipping_address_1", billing["address_1"])
+                await page.fill("#shipping_city", billing["city"])
+                await page.fill("#shipping_postcode", billing["postcode"])
+            except Exception:
+                pass
 
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
@@ -276,7 +291,7 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
 
                 page.on("response", handle_response)
 
-                # Click Place Order using force-click or JS evaluation to avoid scroll blocks
+                # Click Place Order using force-click or JS evaluation
                 place_order_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order'], .place-order button").first
                 if await place_order_btn.count() > 0:
                     try:
@@ -335,7 +350,7 @@ async def index() -> HTMLResponse:
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes optimized headless browser automation with fast page loads & robust order clicks.
+                    Executes automated inspection with billing and shipping address synchronization.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
@@ -361,7 +376,7 @@ Ready for Playwright browser inspection...
 
             button.disabled = true;
             button.textContent = "Running inspection...";
-            output.textContent = "Processing checkout workflow...";
+            output.textContent = "Processing checkout workflow with billing & shipping...";
 
             try {
                 let url = "/api/diagnostics/checkout";
