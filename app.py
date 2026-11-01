@@ -42,7 +42,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Playwright Diagnostics",
-    version="3.6.0",
+    version="3.7.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -260,27 +260,38 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # Fill Global Payments GP-API fields inside secure iframes
+                # Fill Global Payments GP-API fields using sequential keystrokes for SDK detection
                 try:
                     card_filled = False
                     for frame in page.frames:
                         card_input = frame.locator("input[name*='card-number'], input[id*='card-number']").first
                         if await card_input.count() > 0:
-                            await card_input.fill(cc)
-                            await frame.locator("input[name*='card-expiry'], input[id*='card-expiry']").first.fill(f"{mm} / {yy}")
-                            await frame.locator("input[name*='card-cvc'], input[id*='card-cvc']").first.fill(cvv)
+                            await card_input.click()
+                            await card_input.press_sequentially(cc, delay=40)
+                            
+                            expiry_input = frame.locator("input[name*='card-expiry'], input[id*='card-expiry']").first
+                            await expiry_input.click()
+                            await expiry_input.press_sequentially(f"{mm}{yy}", delay=40)
+                            
+                            cvv_input = frame.locator("input[name*='card-cvc'], input[id*='card-cvc']").first
+                            await cvv_input.click()
+                            await cvv_input.press_sequentially(cvv, delay=40)
+                            
                             card_filled = True
                             break
                     
                     if not card_filled:
-                        await page.fill("#globalpayments_gpapi-card-number", cc)
-                        await page.fill("#globalpayments_gpapi-card-expiry", f"{mm} / {yy}")
-                        await page.fill("#globalpayments_gpapi-card-cvc", cvv)
+                        card_input = page.locator("#globalpayments_gpapi-card-number").first
+                        if await card_input.count() > 0:
+                            await card_input.click()
+                            await card_input.press_sequentially(cc, delay=40)
+                            await page.locator("#globalpayments_gpapi-card-expiry").first.press_sequentially(f"{mm}{yy}", delay=40)
+                            await page.locator("#globalpayments_gpapi-card-cvc").first.press_sequentially(cvv, delay=40)
 
-                    # Allow SDK time to generate secure payment token
-                    await page.wait_for_timeout(3000)
+                    # Allow SDK time to bind key events and mint the secure payment token
+                    await page.wait_for_timeout(4000)
                 except Exception as fill_err:
-                    logger.warning(f"Card field fill encountered issue: {fill_err}")
+                    logger.warning(f"Card keystroke input failed: {fill_err}")
 
                 # 3. Check Terms & Conditions checkbox
                 try:
@@ -362,7 +373,7 @@ async def index() -> HTMLResponse:
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes automated inspection with secure iframe card-filling support.
+                    Executes automated inspection with sequential keystroke simulation for SDK token binding.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
@@ -388,7 +399,7 @@ Ready for Playwright browser inspection...
 
             button.disabled = true;
             button.textContent = "Running inspection...";
-            output.textContent = "Processing checkout & filling secure iframes...";
+            output.textContent = "Simulating keystrokes & tokenizing card...";
 
             try {
                 let url = "/api/diagnostics/checkout";
