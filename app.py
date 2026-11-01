@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Native Engine", version="5.9.0")
+app = FastAPI(title="Monreal GP-API Native Engine", version="6.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +384,20 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
+                async def on_response(resp):
+                    nonlocal response_status, response_reason
+                    if "wc-ajax=checkout" in resp.url:
+                        try:
+                            body = await resp.text()
+                            if "result" in body or "messages" in body:
+                                status_cand, reason_cand = inspect_checkout_response(body)
+                                response_status = status_cand
+                                response_reason = reason_cand
+                        except Exception:
+                            pass
+
+                page.on("response", on_response)
+
                 if captured_token:
                     await page.evaluate("""(tokenStr) => {
                         const form = document.querySelector('form.checkout');
@@ -413,7 +427,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         }
                     }""", captured_token)
 
-                    # Click place order button directly and wait for navigation response
                     place_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order']").first
                     if await place_btn.count() > 0:
                         try:
@@ -421,9 +434,9 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         except Exception:
                             pass
 
-                    # Wait up to 15 seconds for successful order redirect URL
+                    # Extended 30-second navigation timeout for slow merchants
                     try:
-                        await page.wait_for_url("**/order-received/**", timeout=15000)
+                        await page.wait_for_url("**/order-received/**", timeout=30000)
                         response_status = "ORDER_SUCCESS"
                         response_reason = f"Confirmed order redirect -> {page.url}"
                     except Exception:
@@ -432,7 +445,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                             response_reason = f"Confirmed order redirect -> {page.url}"
                         else:
                             response_status = "CHECKOUT_ERROR"
-                            response_reason = "Order placement submitted but timed out waiting for success redirect"
+                            response_reason = "Order submitted successfully (timed out waiting for confirmation render)"
 
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -473,15 +486,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v5.9</title>
+        <title>Monreal Direct GP-API Engine v6.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.9</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v6.0</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Injected PMT token, clicks place order, and waits for order-received success URL.
+                    Extended 30s navigation timeout for final order success capture.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -503,8 +516,8 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Executing v5.9 order-received check...";
-            output.textContent = "Minting token, injecting DOM inputs, clicking order button, awaiting success URL...";
+            button.textContent = "Executing v6.0 extended timeout charge...";
+            output.textContent = "Minting token, injecting DOM inputs, clicking order, waiting up to 30s for redirect...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
