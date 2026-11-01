@@ -6,6 +6,7 @@ import json
 import random
 import re
 import time
+import os
 from dataclasses import dataclass, field
 from typing import Any, Final
 from fastapi import FastAPI, Form
@@ -154,7 +155,18 @@ class PlaywrightChecker:
             bin_info = await bin_task
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                # Explicitly point Playwright to the global chromium installation path
+                browser_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+                
+                # Try launching with default, or fallback to system chromium if path is set
+                browser = None
+                try:
+                    browser = await p.chromium.launch(headless=True, args=browser_args)
+                except Exception:
+                    # Fallback to system-installed chromium if playwright binaries fail
+                    os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"] = "/usr/bin/chromium"
+                    browser = await p.chromium.launch(headless=True, executable_path="/usr/bin/chromium", args=browser_args)
+
                 context = await browser.new_context(user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
                 page = await context.new_page()
 
@@ -162,19 +174,15 @@ class PlaywrightChecker:
                 status_result = "DEAD"
 
                 try:
-                    # 1. Visit shop and pick an item
                     await page.goto(SHOP_URL, timeout=15000)
-                    # Click first add to cart button found
                     add_btn = page.locator(".add_to_cart_button, .product_type_simple").first
                     if await add_btn.count() > 0:
                         await add_btn.click()
                         await page.wait_for_timeout(2000)
                     
-                    # 2. Go to Checkout
                     await page.goto(CHECKOUT_URL, timeout=15000)
                     await page.wait_for_load_state("networkidle", timeout=10000)
 
-                    # 3. Fill Billing Info
                     billing = BillingProfile.generate()
                     await page.fill("#billing_first_name", billing["first_name"])
                     await page.fill("#billing_last_name", billing["last_name"])
@@ -184,17 +192,13 @@ class PlaywrightChecker:
                     await page.fill("#billing_phone", billing["phone"])
                     await page.fill("#billing_email", billing["email"])
 
-                    # 4. Fill Global Payments Card Fields
-                    # (Note: Global Payments fields might be inside iframes or standard inputs)
                     try:
                         await page.fill("#globalpayments_credit_card-card-number", card.number)
                         await page.fill("#globalpayments_credit_card-card-expiry", f"{card.month} / {card.short_year}")
                         await page.fill("#globalpayments_credit_card-card-cvc", card.cvv)
                     except Exception:
-                        # Fallback if fields have dynamic IDs
                         pass
 
-                    # 5. Intercept Checkout Response
                     async def handle_response(response):
                         nonlocal response_message, status_result
                         if "?wc-ajax=checkout" in response.url or "checkout" in response.url:
@@ -211,7 +215,6 @@ class PlaywrightChecker:
 
                     page.on("response", handle_response)
 
-                    # 6. Click Place Order
                     place_order_btn = page.locator("#place_order")
                     if await place_order_btn.count() > 0:
                         await place_order_btn.click()
@@ -237,9 +240,6 @@ class PlaywrightChecker:
                     return CheckResult(card=card, status="ERROR", reason=str(exc), latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
 
 
-# ============================================================================
-# WEB DASHBOARD INTERFACE
-# ============================================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
