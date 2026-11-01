@@ -147,20 +147,24 @@ async def discover_product_id(session: AsyncSession) -> str:
 class BillingProfile:
     FIRST_NAMES = ("Sean", "Conor", "Cian", "Oisin", "Liam", "Darragh", "Eoin")
     LAST_NAMES = ("Murphy", "Kelly", "O'Brien", "Ryan", "Byrne", "O'Connor", "Walsh")
-    STREETS = ("14 Winthrop St", "42 Patrick St", "8 Grand Parade", "21 Oliver Plunkett St")
-    CITIES = (("Cork", "Cork", "T12"), ("Dublin", "Dublin", "D02"), ("Galway", "Galway", "H91"))
+    ADDRESSES = (
+        ("14 Winthrop St", "Cork", "Cork", "T12 X285"),
+        ("42 Patrick St", "Cork", "Cork", "T12 R526"),
+        ("8 Grand Parade", "Cork", "Cork", "T12 Y226"),
+        ("21 O'Connell St Lower", "Dublin", "Dublin", "D01 Y4X2"),
+    )
 
     @classmethod
     def generate(cls) -> dict[str, str]:
         fname = random.choice(cls.FIRST_NAMES)
         lname = random.choice(cls.LAST_NAMES)
-        city, state, postcode = random.choice(cls.CITIES)
+        address, city, state, postcode = random.choice(cls.ADDRESSES)
         rand_num = random.randint(1000, 9999)
         return {
             "billing_first_name": fname,
             "billing_last_name": lname,
             "billing_country": "IE",
-            "billing_address_1": random.choice(cls.STREETS),
+            "billing_address_1": address,
             "billing_city": city,
             "billing_state": state,
             "billing_postcode": postcode,
@@ -169,11 +173,12 @@ class BillingProfile:
             "shipping_first_name": fname,
             "shipping_last_name": lname,
             "shipping_country": "IE",
-            "shipping_address_1": random.choice(cls.STREETS),
+            "shipping_address_1": address,
             "shipping_city": city,
             "shipping_state": state,
             "shipping_postcode": postcode,
         }
+
 
 
 # ============================================================
