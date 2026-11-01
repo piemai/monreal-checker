@@ -163,11 +163,8 @@ class PlaywrightChecker:
                 ]
 
                 try:
-                    # Explicitly launch using the system chromium binary path
-                    browser = await p.chromium.launch(
-                        executable_path="/usr/bin/chromium",
-                        args=browser_args
-                    )
+                    # Launch using Playwright's native built-in browser manager
+                    browser = await p.chromium.launch(args=browser_args)
                 except Exception as launch_err:
                     return CheckResult(
                         card=card,
