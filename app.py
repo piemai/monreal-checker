@@ -155,32 +155,31 @@ class PlaywrightChecker:
             bin_info = await bin_task
 
             async with async_playwright() as p:
-                browser_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--headless=new"]
-                
-                # Automatically find available chromium executable on Render container
-                possible_paths = [
-                    "/usr/bin/chromium",
-                    "/usr/bin/chromium-browser",
-                    "/usr/bin/google-chrome",
-                    "/ms-playwright/chromium-1112/chrome-linux/chrome"
+                browser_args = [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--headless=new"
                 ]
-                
-                executable_path = None
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        executable_path = path
-                        break
 
-                browser = None
                 try:
-                    if executable_path:
-                        browser = await p.chromium.launch(executable_path=executable_path, args=browser_args)
-                    else:
-                        browser = await p.chromium.launch(args=browser_args)
+                    # Explicitly launch using the system chromium binary path
+                    browser = await p.chromium.launch(
+                        executable_path="/usr/bin/chromium",
+                        args=browser_args
+                    )
                 except Exception as launch_err:
-                    return CheckResult(card=card, status="ERROR", reason=f"Browser launch failed: {str(launch_err)[:100]}", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
+                    return CheckResult(
+                        card=card,
+                        status="ERROR",
+                        reason=f"Browser launch failed: {str(launch_err)[:100]}",
+                        latency_ms=(time.perf_counter() - t0) * 1000.0,
+                        bin_info=bin_info
+                    )
 
-                context = await browser.new_context(user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+                )
                 page = await context.new_page()
 
                 response_message = "Unmapped response"
