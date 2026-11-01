@@ -1,9 +1,7 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-# Install system dependencies and compiler tools for building wheels (like greenlet)
+# Install system dependencies required for Playwright / Chromium
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    python3-dev \
     wget \
     gnupg \
     libglib2.0-0 \
@@ -29,7 +27,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+# --prefer-binary forces pip to use pre-compiled wheels and prevents source builds
+RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 
 # Install Playwright browser binary and OS dependencies
 RUN playwright install chromium
