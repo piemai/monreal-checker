@@ -1,11 +1,14 @@
 FROM python:3.11-slim
 
-# Force Playwright paths explicitly
+# Set environment variables for Playwright binary locations
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
+    chromium \
+    chromium-driver \
     libglib2.0-0 \
     libnss3 \
     libnspr4 \
@@ -29,10 +32,6 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install browsers globally
-RUN playwright install chromium
-RUN playwright install-deps chromium
 
 COPY . .
 
