@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/render/project/src/.ms-playwright"
 import random
 import re
 import time
