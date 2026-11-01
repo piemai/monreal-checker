@@ -42,7 +42,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Playwright Diagnostics",
-    version="3.2.0",
+    version="3.3.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -276,10 +276,14 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
 
                 page.on("response", handle_response)
 
-                # Click Place Order
+                # Click Place Order using force-click or JS evaluation to avoid scroll blocks
                 place_order_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order'], .place-order button").first
-                await place_order_btn.scroll_into_view_if_needed()
-                await place_order_btn.click(timeout=8000)
+                if await place_order_btn.count() > 0:
+                    try:
+                        await place_order_btn.click(force=True, timeout=5000)
+                    except Exception:
+                        await page.evaluate("document.querySelector('#place_order, button[name=\"woocommerce_checkout_place_order\"]')?.click()")
+                
                 await page.wait_for_timeout(4000)
             
             elapsed = (time.perf_counter() - started) * 1000
@@ -331,7 +335,7 @@ async def index() -> HTMLResponse:
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes optimized headless browser automation with fast page loads.
+                    Executes optimized headless browser automation with fast page loads & robust order clicks.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
