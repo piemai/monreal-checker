@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.7.0")
+app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.6.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,27 +385,11 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
-                # Intercept network responses to catch final redirect or AJAX outcome
-                async def on_response(resp):
-                    nonlocal response_status, response_reason
-                    if "wc-ajax=checkout" in resp.url:
-                        try:
-                            body = await resp.text()
-                            if "result" in body or "messages" in body:
-                                status_cand, reason_cand = inspect_checkout_response(body)
-                                response_status = status_cand
-                                response_reason = reason_cand
-                        except Exception:
-                            pass
-
-                page.on("response", on_response)
-
-                # Inject token directly into DOM form and trigger native WooCommerce AJAX event queue
                 if captured_token:
-                    submit_res = await page.evaluate("""async (tokenStr) => {
+                    dom_form_data = await page.evaluate("""(tokenStr) => {
                         const form = document.querySelector('form.checkout');
-                        if (!form) return "NO_FORM";
-
+                        if (!form) return null;
+                        
                         const terms = form.querySelector('#terms, input[name="terms"]');
                         if (terms) terms.checked = true;
 
@@ -429,38 +413,38 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                             inp.value = tokenStr;
                         }
 
-                        // Set global plugin states
-                        if (window.globalpayments_gpapi) {
-                            window.globalpayments_gpapi.tokenResponse = tokenStr;
+                        const fd = new FormData(form);
+                        fd.set('payment_method', 'globalpayments_gpapi');
+                        fd.set('globalpayments_gpapi-token_response', tokenStr);
+                        fd.set('globalpayments_gpapi_token', tokenStr);
+                        
+                        const obj = {};
+                        for (const [k, v] of fd.entries()) {
+                            obj[k] = v;
                         }
-
-                        // Fire native jQuery checkout submit trigger so frontend handlers execute
-                        if (window.jQuery) {
-                            const $ = window.jQuery;
-                            let outcome = "PENDING";
-                            
-                            // Bind to checkout success/error events
-                            $(document.body).on('checkout_error', function(e, error_message) {
-                                outcome = "CHECKOUT_ERROR_EVENT: " + error_message;
-                            });
-
-                            // Trigger WooCommerce submit
-                            $(form).trigger('submit');
-                            
-                            // Wait briefly for AJAX cycle
-                            await new Promise(r => setTimeout(r, 4000));
-                            return outcome;
-                        }
-                        return "NO_JQUERY";
+                        return obj;
                     }""", captured_token)
 
-                    debug_info["browser_submit_result"] = submit_res
+                    if dom_form_data:
+                        pw_cookies_list = await context.cookies()
+                        cookie_dict = {c["name"]: c["value"] for c in pw_cookies_list}
 
-                    # Allow polling for response
-                    for _ in range(16):
-                        await page.wait_for_timeout(500)
-                        if response_status != "CHECKOUT_READY" and response_reason != "globalpayments_gpapi_checkout_validated":
-                            break
+                        async with AsyncSession(impersonate="chrome120") as api_session:
+                            api_session.cookies.update(cookie_dict)
+                            headers = {
+                                "X-Requested-With": "XMLHttpRequest",
+                                "Referer": CHECKOUT_URL,
+                                "Origin": TARGET_BASE,
+                            }
+                            resp = await api_session.post(
+                                AJAX_CHECKOUT_URL,
+                                data=dom_form_data,
+                                headers=headers,
+                                timeout=15,
+                            )
+                            if resp.status_code == 200:
+                                response_status, response_reason = inspect_checkout_response(resp.text)
+                                debug_info["curl_cffi_ajax_response"] = resp.text[:250]
 
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -501,15 +485,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v5.7</title>
+        <title>Monreal Direct GP-API Engine v5.6</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.7</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.6</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Triggers native form submit inside live browser session with token injected.
+                    Populates multiple plugin token field aliases and posts via curl_cffi session.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -531,8 +515,8 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Executing v5.7 native browser submit...";
-            output.textContent = "Minting token, injecting DOM inputs, triggering browser form submit event...";
+            button.textContent = "Executing v5.6 checkout charge...";
+            output.textContent = "Minting token, syncing all token input aliases, posting via curl_cffi session...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
