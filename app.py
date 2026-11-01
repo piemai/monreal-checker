@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.5.0")
+app = FastAPI(title="Monreal GP-API Direct Tokenizer Engine", version="5.6.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +385,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
-                # Extract live nonce and post via curl_cffi session to match cookies & CSRF tokens precisely
+                # Populate both standard top-level and plugin-specific nested gateway inputs
                 if captured_token:
                     dom_form_data = await page.evaluate("""(tokenStr) => {
                         const form = document.querySelector('form.checkout');
@@ -397,19 +397,28 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         let pm = form.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
                         if (pm) pm.checked = true;
 
-                        let tokenInput = form.querySelector('input[name="globalpayments_gpapi-token_response"], #globalpayments_gpapi-token_response');
-                        if (!tokenInput) {
-                            tokenInput = document.createElement('input');
-                            tokenInput.type = 'hidden';
-                            tokenInput.name = 'globalpayments_gpapi-token_response';
-                            tokenInput.id = 'globalpayments_gpapi-token_response';
-                            form.appendChild(tokenInput);
+                        // Set all possible variants of token input names used by GP-API WooCommerce plugin
+                        const fieldNames = [
+                            'globalpayments_gpapi-token_response',
+                            'globalpayments_gpapi_token',
+                            'wc-globalpayments_gpapi-payment-token'
+                        ];
+                        
+                        for (const name of fieldNames) {
+                            let inp = form.querySelector(`input[name="${name}"]`);
+                            if (!inp) {
+                                inp = document.createElement('input');
+                                inp.type = 'hidden';
+                                inp.name = name;
+                                form.appendChild(inp);
+                            }
+                            inp.value = tokenStr;
                         }
-                        tokenInput.value = tokenStr;
 
                         const fd = new FormData(form);
                         fd.set('payment_method', 'globalpayments_gpapi');
                         fd.set('globalpayments_gpapi-token_response', tokenStr);
+                        fd.set('globalpayments_gpapi_token', tokenStr);
                         
                         const obj = {};
                         for (const [k, v] of fd.entries()) {
@@ -419,7 +428,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     }""", captured_token)
 
                     if dom_form_data:
-                        # Extract cookies from Playwright context to pass into curl_cffi session
                         pw_cookies_list = await context.cookies()
                         cookie_dict = {c["name"]: c["value"] for c in pw_cookies_list}
 
@@ -479,15 +487,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v5.5</title>
+        <title>Monreal Direct GP-API Engine v5.6</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.5</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v5.6</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Syncs Playwright cookies into curl_cffi session and posts serialized form checkout data.
+                    Populates multiple plugin token field aliases and posts via curl_cffi session.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -509,8 +517,8 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Executing v5.5 curl_cffi checkout charge...";
-            output.textContent = "Minting token, syncing browser cookies, posting via curl_cffi session...";
+            button.textContent = "Executing v5.6 checkout charge...";
+            output.textContent = "Minting token, syncing all token input aliases, posting via curl_cffi session...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
