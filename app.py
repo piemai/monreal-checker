@@ -362,17 +362,23 @@ Ready for Playwright browser inspection...
             const card = document.getElementById("cardInput").value;
 
             button.disabled = true;
-            button.textContent = "Launching browser & inspecting...";
-            output.textContent = "Spinning up browser, adding to cart, accepting terms, and executing workflow...";
+            button.textContent = "Running inspection...";
+            output.textContent = "Processing checkout workflow...";
 
             try {
                 let url = "/api/diagnostics/checkout";
-                if (card.trim()) {
-                    url += "?card=" + encodeURIComponent(card);
+                if (card && card.trim()) {
+                    url += "?card=" + encodeURIComponent(card.trim());
                 }
                 const response = await fetch(url);
-                const data = await response.json();
-                output.textContent = JSON.stringify(data, null, 2);
+                const text = await response.text();
+                
+                try {
+                    const data = JSON.parse(text);
+                    output.textContent = JSON.stringify(data, null, 2);
+                } catch (jsonErr) {
+                    output.textContent = "Raw Response: " + text;
+                }
             } catch (error) {
                 output.textContent = "Request failed: " + error.message;
             } finally {
@@ -381,6 +387,7 @@ Ready for Playwright browser inspection...
             }
         }
         </script>
+
     </body>
     </html>
     """)
