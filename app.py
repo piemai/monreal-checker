@@ -40,8 +40,10 @@ app = FastAPI(
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
 
 NONCE_RE = re.compile(
-    r'name=["\']woocommerce-process-checkout-nonce["\']'
-    r'\s+value=["\']([^"\']+)["\']',
+    r'name=["\']woocommerce-process-checkout-nonce["\']\s+value=["\']([^"\']+)["\']'
+    r'|name=["\']update_order_review_nonce["\']\s+value=["\']([^"\']+)["\']'
+    r'|id=["\']woocommerce-process-checkout-nonce["\']\s+value=["\']([^"\']+)["\']'
+    r'|["\']woocommerce-process-checkout-nonce["\']\s*:\s*["\']([a-f0-9]+)["\']',
     re.IGNORECASE,
 )
 
