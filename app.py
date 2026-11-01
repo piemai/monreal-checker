@@ -42,7 +42,7 @@ logger = logging.getLogger("woocommerce.diagnostics")
 
 app = FastAPI(
     title="WooCommerce Playwright Diagnostics",
-    version="3.1.0",
+    version="3.2.0",
 )
 
 CHECKOUT_URL = f"{TARGET_BASE}{CHECKOUT_PATH}"
@@ -222,16 +222,16 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
         gateway_name = "globalpayments_gpapi"
 
         try:
-            # 1. Go to Shop and Add to Cart
-            await page.goto(SHOP_URL, timeout=HEALTH_TIMEOUT * 1000)
+            # 1. Go to Shop and Add to Cart swiftly using domcontentloaded
+            await page.goto(SHOP_URL, timeout=10000, wait_until="domcontentloaded")
             add_btn = page.locator(".add_to_cart_button, .product_type_simple").first
             if await add_btn.count() > 0:
                 await add_btn.click()
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(1000)
 
             # 2. Go to Checkout
-            await page.goto(CHECKOUT_URL, timeout=HEALTH_TIMEOUT * 1000)
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            await page.goto(CHECKOUT_URL, timeout=10000, wait_until="domcontentloaded")
+            await page.wait_for_selector("#billing_first_name", timeout=8000)
 
             billing = BillingProfile.generate()
             await page.fill("#billing_first_name", billing["first_name"])
@@ -252,16 +252,10 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
                         await card_input.fill(cc)
                         await page.locator("#globalpayments_gpapi-card-expiry, input[name*='card-expiry']").first.fill(f"{mm} / {yy}")
                         await page.locator("#globalpayments_gpapi-card-cvc, input[name*='card-cvc']").first.fill(cvv)
-                    else:
-                        for frame in page.frames:
-                            frame_input = frame.locator("input[name*='card'], input[id*='card']").first
-                            if await frame_input.count() > 0:
-                                await frame_input.fill(cc)
-                                break
                 except Exception as fill_err:
                     logger.warning(f"Card field fill encountered issue: {fill_err}")
 
-                # 3. Check Terms & Conditions checkbox to enable order placement
+                # 3. Check Terms & Conditions checkbox
                 try:
                     terms_box = page.locator("#terms, input[name='terms']")
                     if await terms_box.count() > 0:
@@ -285,8 +279,8 @@ async def run_playwright_inspection(card_line: str | None = None) -> DiagnosticR
                 # Click Place Order
                 place_order_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order'], .place-order button").first
                 await place_order_btn.scroll_into_view_if_needed()
-                await place_order_btn.click(timeout=10000)
-                await page.wait_for_timeout(6000)
+                await place_order_btn.click(timeout=8000)
+                await page.wait_for_timeout(4000)
             
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -337,7 +331,7 @@ async def index() -> HTMLResponse:
             </h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Executes headless browser automation with JavaScript tokenization & terms acceptance.
+                    Executes optimized headless browser automation with fast page loads.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV) - Optional</label>
@@ -387,7 +381,6 @@ Ready for Playwright browser inspection...
             }
         }
         </script>
-
     </body>
     </html>
     """)
