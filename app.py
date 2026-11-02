@@ -1,5 +1,6 @@
 # app.py
-from __core__ import *
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -10,6 +11,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs
+
+if os.name != "nt" and not os.getenv("LOCAL_DEV"):
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.ms-playwright")
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -28,8 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-# FastAPI ASGI application instance required by Uvicorn / Render deployment
-app = FastAPI(title="Monreal GP-API Native Engine", version="6.3.0")
+app = FastAPI(title="Monreal GP-API Native Engine", version="6.4.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,15 +478,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v6.3</title>
+        <title>Monreal Direct GP-API Engine v6.4</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v6.3</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v6.4</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Verified ASGI app export fix for Uvicorn and Render deployment.
+                    Clean ASGI application entry point. Ready for production deployment.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -505,7 +508,7 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Executing v6.3 deploy fix charge...";
+            button.textContent = "Executing v6.4 deploy-ready charge...";
             output.textContent = "Minting token, injecting inputs, triggering submission...";
             try {
                 let url = "/api/diagnostics/checkout";
