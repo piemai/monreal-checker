@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="44.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="45.0.0")
 
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
     "access_token": os.getenv("GP_ACCESS_TOKEN", ""),
@@ -269,7 +269,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             except Exception:
                 pass
 
-            # Type-safe check: html_len is an int
             if not access_token or html_len < 130000:
                 access_token = os.getenv("GP_ACCESS_TOKEN") or GLOBAL_TOKEN_MEMORY["access_token"]
                 debug_info["token_source"] = "env_or_memory_fallback"
@@ -424,15 +423,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v44.0</title>
+    <title>Monreal GP-API Pure REST Checker v45.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v44.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v45.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Type Safe v44.0
+                Stable v45.0
             </span>
         </div>
 
@@ -442,4 +441,149 @@ async def index() -> str:
                     Proxy List (host:port:user:pass or user:pass@host:port — optional, one per line)
                 </label>
                 <textarea id="proxyInput" rows="2" placeholder="86oovvcj.as.thordata.net:9999:username:password"
-                    class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none
+                    class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+            </div>
+
+            <div>
+                <label class="block text-xs font-medium text-slate-400 mb-1">
+                    Paste Cards (CC|MM|YYYY|CVV — one per line)
+                </label>
+                <textarea id="cardInput" rows="5" placeholder="5454545454545454|08|2028|123"
+                    class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+            </div>
+
+            <div class="grid grid-cols-3 gap-3 text-center text-xs font-mono">
+                <div class="bg-slate-950 border border-emerald-800/60 rounded-lg p-2.5">
+                    <span class="text-slate-400 block">LIVE</span>
+                    <span id="liveCount" class="text-lg font-bold text-emerald-400">0</span>
+                </div>
+                <div class="bg-slate-950 border border-rose-800/60 rounded-lg p-2.5">
+                    <span class="text-slate-400 block">DEAD</span>
+                    <span id="deadCount" class="text-lg font-bold text-rose-400">0</span>
+                </div>
+                <div class="bg-slate-950 border border-slate-800 rounded-lg p-2.5">
+                    <span class="text-slate-400 block">CHECKED</span>
+                    <span id="checkedCount" class="text-lg font-bold text-slate-200">0</span>
+                </div>
+            </div>
+
+            <button
+                id="checkButton"
+                onclick="runBatchChecker()"
+                class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
+                Start High-Speed Batch Check
+            </button>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live Cards</h2>
+                    <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
+                </div>
+                <div>
+                    <h2 class="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">Dead / Declined</h2>
+                    <div id="deadBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-rose-300 border border-rose-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
+                </div>
+            </div>
+
+            <div>
+                <h2 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Last Raw Diagnostic</h2>
+                <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800 max-h-64 overflow-y-auto">Ready...</pre>
+            </div>
+        </div>
+    </main>
+    <script>
+    async function runBatchChecker() {
+        const button = document.getElementById("checkButton");
+        const output = document.getElementById("output");
+        const liveBox = document.getElementById("liveBox");
+        const deadBox = document.getElementById("deadBox");
+        const rawLines = document.getElementById("cardInput").value
+            .split("\\n")
+            .map(l => l.trim())
+            .filter(l => l.length > 0);
+        const proxyLines = document.getElementById("proxyInput").value
+            .split(/[\\n,]/)
+            .map(l => l.trim())
+            .filter(l => l.length > 0);
+
+        if (rawLines.length === 0) {
+            output.textContent = "Paste at least one card line (CC|MM|YYYY|CVV).";
+            return;
+        }
+
+        button.disabled = true;
+        let live = 0, dead = 0, checked = 0;
+        document.getElementById("liveCount").textContent = "0";
+        document.getElementById("deadCount").textContent = "0";
+        document.getElementById("checkedCount").textContent = "0";
+        liveBox.innerHTML = "";
+        deadBox.innerHTML = "";
+
+        for (let i = 0; i < rawLines.length; i++) {
+            const card = rawLines[i];
+            let proxy = "";
+            if (proxyLines.length > 0) {
+                proxy = proxyLines[i % proxyLines.length];
+            }
+
+            button.textContent = `Checking (${i + 1}/${rawLines.length})...`;
+            output.textContent = `Running REST check for card ${i + 1} using proxy: ${proxy || 'DIRECT'}...`;
+
+            try {
+                let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(card);
+                if (proxy) {
+                    url += "&proxy=" + encodeURIComponent(proxy);
+                }
+                const response = await fetch(url);
+                const data = await response.json();
+                output.textContent = JSON.stringify(data, null, 2);
+
+                checked++;
+                document.getElementById("checkedCount").textContent = String(checked);
+
+                const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
+                const proxyTag = data.proxy_used ? ` [Proxy: ${data.proxy_used}]` : "";
+                const lineSummary = `[${data.status}] ${card} -> ${data.reason}${proxyTag} | ${bankStr} (${data.latency_ms}ms)`;
+
+                const row = document.createElement("div");
+                row.textContent = lineSummary;
+
+                if (data.status === "LIVE" || data.status === "ORDER_SUCCESS") {
+                    live++;
+                    document.getElementById("liveCount").textContent = String(live);
+                    liveBox.appendChild(row);
+                } else {
+                    dead++;
+                    document.getElementById("deadCount").textContent = String(dead);
+                    deadBox.appendChild(row);
+                }
+
+                await new Promise(r => setTimeout(r, 1200));
+            } catch (err) {
+                checked++;
+                dead++;
+                document.getElementById("checkedCount").textContent = String(checked);
+                document.getElementById("deadCount").textContent = String(dead);
+                const row = document.createElement("div");
+                row.textContent = `[ERROR] ${card} -> ${err.message}`;
+                deadBox.appendChild(row);
+            }
+        }
+
+        button.disabled = false;
+        button.textContent = "Start High-Speed Batch Check";
+    }
+    </script>
+</body>
+</html>"""
+
+
+@app.get("/api/diagnostics/checkout")
+async def checkout_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
+    result = await run_rest_inspection(card_line=card, proxy_url=proxy)
+    return result.to_dict()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
