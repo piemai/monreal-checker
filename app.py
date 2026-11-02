@@ -27,11 +27,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="42.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="43.0.0")
 
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", "pk_live_51OQ5hZ0AL4..."),
-    "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
+    "access_token": os.getenv("GP_ACCESS_TOKEN", ""),
+    "checkout_nonce": os.getenv("WC_NONCE", ""),
     "gp_env": "production",
 }
 
@@ -246,18 +246,21 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 if nonce_match:
                     checkout_nonce = nonce_match.group(1)
 
-                script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-                for block in script_blocks:
-                    if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken", "public_key")):
-                        t_match = re.search(r'["\'](?:accessToken|public_key|token|api_key)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
-                        if t_match:
-                            access_token = t_match.group(1)
-                            break
+                # Advanced regex search for real GlobalPayments public key or bearer token formats
+                token_matches = re.findall(r'["\'](pk_live_[a-zA-Z0-9]{20,}|prod_[a-zA-Z0-9]{20,}|[a-zA-Z0-9_-]{40,})["\']', html_content)
+                for candidate in token_matches:
+                    if len(candidate) > 25 and not candidate.startswith("wc_") and not candidate.startswith("wp_"):
+                        access_token = candidate
+                        break
 
                 if not access_token:
-                    m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
-                    if m:
-                        access_token = m.group(1)
+                    script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
+                    for block in script_blocks:
+                        if "globalpayments" in block.lower() or "gpapi" in block.lower():
+                            t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
+                            if t_match:
+                                access_token = t_match.group(1)
+                                break
 
                 env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
                 if env_match:
@@ -265,9 +268,10 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             except Exception:
                 pass
 
+            # Fallback to environment variable or memory cache
             if not access_token or len(html_content := debug_info.get("checkout_html_len", 150000)) < 130000:
                 access_token = os.getenv("GP_ACCESS_TOKEN") or GLOBAL_TOKEN_MEMORY["access_token"]
-                debug_info["token_source"] = "hardcoded_memory_fallback"
+                debug_info["token_source"] = "env_or_memory_fallback"
             else:
                 debug_info["token_source"] = "scraped_live"
                 if access_token:
@@ -285,7 +289,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract access token.",
+                    reason="Failed to extract access token. Please set GP_ACCESS_TOKEN in Render environment variables.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -419,15 +423,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v42.0</title>
+    <title>Monreal GP-API Pure REST Checker v43.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v42.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v43.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Syntax Fixed v42.0
+                Active Sniffer v43.0
             </span>
         </div>
 
