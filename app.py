@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="11.0.0")
+app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="12.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,30 +174,66 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
     return "DEAD", clean_message or "Unrecognized gateway response"
 
 
-async def check_proxy_health(proxy_url: str) -> bool:
-    """Health check ping to ensure proxy is alive and routing traffic."""
-    if not proxy_url:
+def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
+    """Parses user:pass@host:port or host:port into Playwright and curl_cffi proxy dicts."""
+    raw = proxy_url.strip()
+    if not raw:
+        return {}
+    
+    # Extract credentials if present
+    username, password = None, None
+    clean_url = raw
+    if "://" in clean_url:
+        scheme, rest = clean_url.split("://", 1)
+    else:
+        scheme, rest = "http", clean_url
+
+    if "@" in rest:
+        creds, hostport = rest.rsplit("@", 1)
+        if ":" in creds:
+            username, password = creds.split(":", 1)
+        else:
+            username = creds
+        clean_url = f"{scheme}://{hostport}"
+    else:
+        clean_url = f"{scheme}://{rest}"
+
+    pw_proxy: dict[str, Any] = {"server": clean_url}
+    if username:
+        pw_proxy["username"] = username
+    if password:
+        pw_proxy["password"] = password
+
+    return {"server": clean_url, "pw": pw_proxy, "raw": raw}
+
+
+async def check_proxy_health(proxy_info: dict[str, Any]) -> bool:
+    if not proxy_info:
         return True
-    formatted_proxy = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
+    server_url = proxy_info["server"]
+    proxies = {"http": server_url, "https": server_url}
     try:
-        async with AsyncSession(impersonate="chrome120", proxies={"http": formatted_proxy, "https": formatted_proxy}) as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
             resp = await session.get("https://httpbin.org/ip", timeout=6)
             return resp.status_code == 200
     except Exception:
-        return false
+        return False
 
 
-async def seed_cart_fast(session: AsyncSession) -> dict[str, str]:
+async def seed_cart_fast(session: AsyncSession, proxy_info: dict[str, Any] | None) -> dict[str, str]:
     try:
-        shop_resp = await session.get(SHOP_URL, timeout=12)
-        match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-        product_id = (match.group(1) or match.group(2)) if match else "18"
-        await session.post(
-            f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-            data={"product_id": product_id, "quantity": "1"},
-            timeout=10,
-        )
-        return dict(session.cookies)
+        proxies = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
+        async with session:
+            shop_resp = await session.get(SHOP_URL, timeout=12, proxies=proxies)
+            match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+            product_id = (match.group(1) or match.group(2)) if match else "18"
+            cart_resp = await session.post(
+                f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+                data={"product_id": product_id, "quantity": "1"},
+                timeout=10,
+                proxies=proxies,
+            )
+            return dict(session.cookies)
     except Exception as exc:
         logger.warning(f"Fast cart seed fallback: {exc}")
         return {}
@@ -210,7 +246,7 @@ async def mint_gpapi_token_direct(
     mm: str,
     yy: str,
     cvv: str,
-    proxy_url: str | None = None,
+    proxy_info: dict[str, Any] | None = None,
     account_name: str | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     base_url = (
@@ -242,7 +278,7 @@ async def mint_gpapi_token_direct(
     if account_name:
         payload["account_name"] = account_name
 
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    proxies = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
             resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
@@ -271,19 +307,17 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
     card_masked = None
     debug_info: dict[str, Any] = {}
 
-    formatted_proxy = None
-    if proxy_url and proxy_url.strip():
-        raw_p = proxy_url.strip()
-        formatted_proxy = raw_p if "://" in raw_p else f"http://{raw_p}"
-        is_healthy = await check_proxy_health(formatted_proxy)
+    proxy_info = parse_proxy_string(proxy_url) if proxy_url and proxy_url.strip() else None
+    if proxy_info:
+        is_healthy = await check_proxy_health(proxy_info)
         debug_info["proxy_health_check"] = "HEALTHY" if is_healthy else "DEAD_OR_UNREACHABLE"
         if not is_healthy:
             elapsed = (time.perf_counter() - started) * 1000
             return DiagnosticResult(
                 status="PROXY_ERROR",
-                reason=f"Proxy health check failed for {raw_p}",
+                reason=f"Proxy health check failed for {proxy_info['raw']}",
                 latency_ms=elapsed,
-                proxy_used=raw_p,
+                proxy_used=proxy_info["raw"],
                 debug_info=debug_info,
             )
 
@@ -302,10 +336,8 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
         card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
         bin_info = await fetch_bin_metadata(cc_num)
 
-    proxies_dict = {"server": formatted_proxy} if formatted_proxy else None
-
-    async with AsyncSession(impersonate="chrome120", proxies=proxies_dict if formatted_proxy else None) as http_session:
-        seeded_cookies = await seed_cart_fast(http_session)
+    async with AsyncSession(impersonate="chrome120") as http_session:
+        seeded_cookies = await seed_cart_fast(http_session, proxy_info)
 
     async with async_playwright() as p:
         browser_args = [
@@ -313,29 +345,31 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
         ]
-        if formatted_proxy:
-            browser_args.append(f"--proxy-server={formatted_proxy}")
-
         try:
             browser = await p.chromium.launch(headless=HEADLESS_MODE, args=browser_args)
         except Exception as launch_err:
             elapsed = (time.perf_counter() - started) * 1000
             return DiagnosticResult(
                 status="SERVER_ERROR",
-                reason=f"Browser launch failed with proxy: {str(launch_err)[:120]}",
+                reason=f"Browser launch failed: {str(launch_err)[:120]}",
                 latency_ms=elapsed,
                 card_masked=card_masked,
                 proxy_used=proxy_url,
             )
 
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
+        # Pass native Playwright proxy configuration dictionary with auth support
+        context_opts: dict[str, Any] = {
+            "viewport": {"width": 1280, "height": 900},
+            "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-        )
+        }
+        if proxy_info and "pw" in proxy_info:
+            context_opts["proxy"] = proxy_info["pw"]
+
+        context = await browser.new_context(**context_opts)
 
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -435,7 +469,7 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
                         mm=mm,
                         yy=yy,
                         cvv=cvv,
-                        proxy_url=formatted_proxy,
+                        proxy_info=proxy_info,
                         account_name=account_name,
                     )
                     if minted_id:
@@ -570,15 +604,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Proxy Checker v11.0</title>
+        <title>Monreal GP-API Proxy Checker v12.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v11.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v12.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Proxy Health Check Active
+                    Native Playwright Proxy Dict
                 </span>
             </div>
 
