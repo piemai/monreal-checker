@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="53.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="54.0.0")
 
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
     "access_token": os.getenv("GP_ACCESS_TOKEN", "ILDALAN_MO_DITO_YUNG_TOTOO_MONG_LIVE_TOKEN"),
@@ -94,7 +94,7 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
     bin_code = card_number[:6]
     default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
     try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies, verify=False) as session:
             resp = await session.get(
                 f"https://lookup.binlist.net/{bin_code}",
                 headers={"Accept-Version": "3"},
@@ -229,7 +229,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
     }
 
     try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
             await asyncio.sleep(random.uniform(0.4, 0.9))
 
             try:
@@ -422,7 +422,7 @@ async def test_proxy(proxy: str) -> dict[str, Any]:
     proxy_info = parse_proxy_string(proxy)
     proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
     try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict) as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, verify=False) as session:
             resp = await session.get("https://httpbin.org/ip", timeout=6)
             latency = (time.perf_counter() - start) * 1000
             if resp.status_code == 200:
@@ -439,15 +439,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Hybrid Auto-Prune Checker v53.0</title>
+    <title>Monreal GP-API SSL-Bypassed Checker v54.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Hybrid Auto-Prune Checker v53.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API SSL-Bypassed Checker v54.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                v48 Core + Auto-Prune v53.0
+                SSL Verify False v54.0
             </span>
         </div>
 
