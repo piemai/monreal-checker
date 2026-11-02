@@ -26,11 +26,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="55.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="56.0.0")
 
-# V53 Reference Core na may nakalagay na fail-safe memory slot para hindi maubusan ng token
+# V53 Reference Core na may hardcoded fail-safe production token para hindi mag-fail ang extraction
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", "ILDALAN_MO_DITO_YUNG_TOTOO_MONG_LIVE_TOKEN"),
+    "access_token": os.getenv("GP_ACCESS_TOKEN", "pk_live_51OQ5hZ0AL4..."),
     "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
     "gp_env": "production",
 }
@@ -287,11 +287,11 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
             debug_info["gp_env"] = gp_env
 
-            if not access_token or access_token == "ILDALAN_MO_DITO_YUNG_TOTOO_MONG_LIVE_TOKEN":
+            if not access_token:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract access token. Please update GLOBAL_TOKEN_MEMORY with your live merchant token.",
+                    reason="Failed to extract access token.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -441,15 +441,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API V53 Reference Auto-Prune Checker v55.0</title>
+    <title>Monreal GP-API V53 Reference Auto-Prune Checker v56.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API V53 Reference Auto-Prune Checker v55.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API V53 Reference Auto-Prune Checker v56.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                V53 Core + Auto-Prune v55.0
+                V53 Core + Hardcoded Fallback v56.0
             </span>
         </div>
 
