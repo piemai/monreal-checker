@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="21.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="22.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,40 +230,35 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             checkout_nonce = nonce_match.group(1) if nonce_match else ""
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
 
-            # Multi-vector token regex search
+            # Smart JSON script block parser for globalpayments configuration
             access_token = None
-            patterns = [
-                r'"accessToken"\s*:\s*"([^"]+)"',
-                r'access_token["\']?\s*[:=]\s*["\']([^"\']+)',
-                r'public_key["\']?\s*[:=]\s*["\']([^"\']+)',
-                r'api_key["\']?\s*[:=]\s*["\']([^"\']+)',
-                r'token["\']?\s*[:=]\s*["\'](pk_live_[^"\']+)["\']',
-            ]
-            for pat in patterns:
-                m = re.search(pat, html_content, re.IGNORECASE)
-                if m and m.lastindex:
-                    access_token = m.group(1)
-                    break
+            gp_env = "production"
 
-            # Fallback search in script tags for globalpayments configuration objects
+            script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
+            for block in script_blocks:
+                if "globalpayments" in block.lower() or "gpapi" in block.lower() or "accesstoken" in block.lower():
+                    # Search for access token inside JS object assignments
+                    t_match = re.search(r'["\']accessToken["\']\s*[:=]\s*["\']([^"\']+)["\']', block, re.IGNORECASE)
+                    if t_match:
+                        access_token = t_match.group(1)
+                    e_match = re.search(r'["\']env(?:ironment)?["\']\s*[:=]\s*["\']([^"\']+)["\']', block, re.IGNORECASE)
+                    if e_match:
+                        gp_env = e_match.group(1)
+
+            # Fallback regex search across entire HTML if script blocks missed it
             if not access_token:
-                script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-                for block in script_blocks:
-                    if "globalpayments" in block.lower() or "gpapi" in block.lower():
-                        sub_m = re.search(r'["\']([a-zA-Z0-9_\-\.]{30,})["\']', block)
-                        if sub_m:
-                            access_token = sub_m.group(1)
-                            break
+                m = re.search(r'"accessToken"\s*:\s*"([^"]+)"', html_content, re.IGNORECASE)
+                if m:
+                    access_token = m.group(1)
 
-            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', html_content, re.IGNORECASE)
-            gp_env = env_match.group(1) if env_match else "production"
             debug_info["gp_access_token_found"] = bool(access_token)
+            debug_info["gp_env"] = gp_env
 
             if not access_token:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract merchant access token from checkout page via multi-vector scan",
+                    reason="Failed to extract merchant access token via JSON script block parser",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -395,15 +390,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Pure REST Checker v21.0</title>
+        <title>Monreal GP-API Pure REST Checker v22.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v21.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v22.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Multi-Pattern Tokenizer
+                    JSON Script Block Parser
                 </span>
             </div>
 
