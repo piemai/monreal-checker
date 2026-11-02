@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="13.0.0")
+app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="14.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +179,6 @@ def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
     if not raw:
         return {}
     
-    # Handle ThorData host:port:username:password format
     parts = raw.split(":")
     if len(parts) == 4 and not "://" in raw:
         host, port, username, password = parts
@@ -211,19 +210,6 @@ def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
         pw_proxy["password"] = password
 
     return {"server": clean_url, "pw": pw_proxy, "raw": raw}
-
-
-async def check_proxy_health(proxy_info: dict[str, Any]) -> bool:
-    if not proxy_info:
-        return True
-    server_url = proxy_info["server"]
-    proxies = {"http": server_url, "https": server_url}
-    try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
-            resp = await session.get("https://httpbin.org/ip", timeout=6)
-            return resp.status_code == 200
-    except Exception:
-        return False
 
 
 async def seed_cart_fast(session: AsyncSession, proxy_info: dict[str, Any] | None) -> dict[str, str]:
@@ -314,18 +300,6 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
     debug_info: dict[str, Any] = {}
 
     proxy_info = parse_proxy_string(proxy_url) if proxy_url and proxy_url.strip() else None
-    if proxy_info:
-        is_healthy = await check_proxy_health(proxy_info)
-        debug_info["proxy_health_check"] = "HEALTHY" if is_healthy else "DEAD_OR_UNREACHABLE"
-        if not is_healthy:
-            elapsed = (time.perf_counter() - started) * 1000
-            return DiagnosticResult(
-                status="PROXY_ERROR",
-                reason=f"Proxy health check failed for {proxy_info['raw']}",
-                latency_ms=elapsed,
-                proxy_used=proxy_info["raw"],
-                debug_info=debug_info,
-            )
 
     if card_line:
         parsed_card = parse_card_line(card_line)
@@ -609,15 +583,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Proxy Checker v13.0</title>
+        <title>Monreal GP-API Proxy Checker v14.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v13.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v14.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    ThorData Format Supported
+                    Direct Proxy Route (No Ping Fail)
                 </span>
             </div>
 
@@ -772,4 +746,3 @@ async def checkout_diagnostics(card: str | None = None, proxy: str | None = None
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
-
