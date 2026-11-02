@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API 3DS/OTP Catcher Checker", version="61.0.0")
+app = FastAPI(title="Monreal GP-API Full Checkout Checker", version="60.0.0")
 
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
     "access_token": os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny"),
@@ -164,9 +164,6 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
         lower = raw_body.lower()
         if "order-received" in lower or '"result":"success"' in lower:
             return "LIVE", "Order Approved (Redirected to order-received)"
-        # Lahat ng unsuccessful o unable to process dahil sa 3DS/OTP ay sinasalo na bilang LIVE
-        if any(k in lower for k in ("unsuccessful", "unable to process", "3d secure", "authentication", "challenge", "3ds", "otp")):
-            return "LIVE", "LIVE / 3DS / OTP Challenge Required"
         return "DEAD", "Non-JSON error response from checkout endpoint"
 
     if not isinstance(data, dict):
@@ -183,9 +180,11 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
         return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
 
     lower_msg = clean_message.lower()
-    # Pagsalo sa mga 3DS, OTP, at Live Bank Responses bilang LIVE
-    if any(k in lower_msg for k in ("3d secure", "authentication", "challenge", "3ds", "otp", "unsuccessful", "unable to process", "insufficient", "cvv", "security code", "incorrect cvc")):
-        return "LIVE", f"LIVE / Bank Response: {clean_message}"
+    if any(k in lower_msg for k in ("3d secure", "authentication", "challenge", "3ds", "otp")):
+        return "LIVE", f"3DS Challenge Required: {clean_message}"
+
+    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "exceeded")):
+        return "LIVE", f"Card Response / Decline: {clean_message}"
 
     if result == "failure":
         return "DEAD", clean_message or "Gateway Declined Transaction"
@@ -397,15 +396,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API 3DS/OTP Catcher Checker v61.0</title>
+    <title>Monreal GP-API Full Checkout Checker v60.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API 3DS/OTP Catcher Checker v61.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Full Checkout Checker v60.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                3DS/OTP Catcher Mode
+                Tokenize + Finalize Mode
             </span>
         </div>
 
@@ -436,7 +435,7 @@ async def index() -> str:
 
             <div class="grid grid-cols-3 gap-3 text-center text-xs font-mono">
                 <div class="bg-slate-950 border border-emerald-800/60 rounded-lg p-2.5">
-                    <span class="text-slate-400 block">LIVE / 3DS</span>
+                    <span class="text-slate-400 block">LIVE</span>
                     <span id="liveCount" class="text-lg font-bold text-emerald-400">0</span>
                 </div>
                 <div class="bg-slate-950 border border-rose-800/60 rounded-lg p-2.5">
@@ -453,12 +452,12 @@ async def index() -> str:
                 id="checkButton"
                 onclick="runBatchChecker()"
                 class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                Start 3DS/OTP Catcher Check
+                Start Full Checkout Check
             </button>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / 3DS / OTP / Approved</h2>
+                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / Approved / 3DS</h2>
                     <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
                 </div>
                 <div>
@@ -564,7 +563,7 @@ async def index() -> str:
         for (let i = 0; i < executionPairs.length; i++) {
             const pair = executionPairs[i];
             button.textContent = `Checking (${i + 1}/${executionPairs.length})...`;
-            output.textContent = `Running 3DS/OTP check with proxy: ${pair.proxy || 'DIRECT'}...`;
+            output.textContent = `Running full checkout check with proxy: ${pair.proxy || 'DIRECT'}...`;
 
             try {
                 let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(pair.card);
@@ -608,7 +607,7 @@ async def index() -> str:
         }
 
         button.disabled = false;
-        button.textContent = "Start 3DS/OTP Catcher Check";
+        button.textContent = "Start Full Checkout Check";
     }
     </script>
 </body>
