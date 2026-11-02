@@ -27,11 +27,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="41.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="42.0.0")
 
-# Permanent hardcoded fallback memory for monreal.ie merchant token
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", "pk_live_51OQ5hZ0AL4...",  # <- Replace with your working live token if needed
+    "access_token": os.getenv("GP_ACCESS_TOKEN", "pk_live_51OQ5hZ0AL4..."),
     "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
     "gp_env": "production",
 }
@@ -266,7 +265,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             except Exception:
                 pass
 
-            # Robust fallback selection
             if not access_token or len(html_content := debug_info.get("checkout_html_len", 150000)) < 130000:
                 access_token = os.getenv("GP_ACCESS_TOKEN") or GLOBAL_TOKEN_MEMORY["access_token"]
                 debug_info["token_source"] = "hardcoded_memory_fallback"
@@ -287,7 +285,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract access token. Please verify hardcoded token string.",
+                    reason="Failed to extract access token.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -421,15 +419,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v41.0</title>
+    <title>Monreal GP-API Pure REST Checker v42.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v41.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v42.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Fail-Safe Default v41.0
+                Syntax Fixed v42.0
             </span>
         </div>
 
