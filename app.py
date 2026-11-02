@@ -9,6 +9,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI
@@ -85,6 +86,21 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
     return cc, mm, short_yy, cvv
 
 
+def is_card_expired(mm: str, yy: str) -> bool:
+    try:
+        month = int(mm)
+        full_year = int(f"20{yy}" if len(yy) == 2 else yy)
+        now = datetime.now()
+        # Kung mas mababa ang taon, o kung pareho ang taon pero mas mababa ang buwan kaysa ngayon
+        if full_year < now.year:
+            return True
+        if full_year == now.year and month < now.month:
+            return True
+    except Exception:
+        return True
+    return False
+
+
 async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
     bin_code = card_number[:6]
     default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
@@ -143,8 +159,23 @@ async def run_auth_token_inspection(card_line: str | None = None, proxy_url: str
                 card_masked=card_line.strip()[:19],
                 proxy_used=proxy_url,
             )
-        cc_num = parsed_card[0]
-        card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{parsed_card[1]}|{parsed_card[2]}|{parsed_card[3]}"
+        
+        cc_num, mm, yy, cvv = parsed_card
+        card_masked = f"{cc_num[:6]}******{cc_num[-4:]}|{mm}|{yy}|{cvv}"
+        
+        # Expiration Guard: Salain agad ang expired na bago pa tawagin ang gateway
+        if is_card_expired(mm, yy):
+            elapsed = (time.perf_counter() - started) * 1000
+            bin_info = await fetch_bin_metadata(cc_num, proxies_dict)
+            return DiagnosticResult(
+                status="DEAD",
+                reason="Declined: Card Expired",
+                latency_ms=elapsed,
+                bin_info=bin_info,
+                card_masked=card_masked,
+                proxy_used=proxy_url,
+            )
+
         bin_info = await fetch_bin_metadata(cc_num, proxies_dict)
 
     browser_headers = {
