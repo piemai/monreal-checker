@@ -26,11 +26,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="56.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="58.0.0")
 
-# V53 Reference Core na may hardcoded fail-safe production token para hindi mag-fail ang extraction
+# V53 Reference Core na may in-inject na totoong live token mula sa site params
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", "pk_live_51OQ5hZ0AL4..."),
+    "access_token": os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny"),
     "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
     "gp_env": "production",
 }
@@ -270,7 +270,6 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             gp_env = env_match.group(1) if env_match else "production"
 
-            # V53 Core Hybrid Fail-Safe
             if access_token and len(html_content) >= 130000:
                 GLOBAL_TOKEN_MEMORY["access_token"] = access_token
                 if checkout_nonce:
@@ -441,15 +440,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API V53 Reference Auto-Prune Checker v56.0</title>
+    <title>Monreal GP-API V53 Reference Auto-Prune Checker v58.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API V53 Reference Auto-Prune Checker v56.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API V53 Reference Auto-Prune Checker v58.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                V53 Core + Hardcoded Fallback v56.0
+                V53 Core + Real Token v58.0
             </span>
         </div>
 
