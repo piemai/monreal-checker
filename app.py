@@ -162,7 +162,7 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
         lower = raw_body.lower()
         if "order-received" in lower or '"result":"success"' in lower:
             return "LIVE", "Order Approved (Redirected to order-received)"
-        return "DEAD", "Non-JSON error response from checkout endpoint"
+        return "DEAD", f"Response: {raw_body[:120]}"
 
     if not isinstance(data, dict):
         return "DEAD", "Unexpected checkout response structure"
@@ -182,6 +182,7 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
         return "LIVE", f"Card Response: {clean_message}"
 
     if result == "failure":
+        # Kunin ang mismong gateway/bank error message kung naroroon sa messages
         return "DEAD", clean_message or "Gateway Declined Transaction"
 
     return "DEAD", clean_message or "Unrecognized gateway response"
@@ -229,12 +230,10 @@ async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: 
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
             await session.get(TARGET_BASE, timeout=8)
             
-            # Smart Product Finder: Maghanap ng kahit anong in-stock product sa shop page
             shop_resp = await session.get(SHOP_URL, timeout=10)
             shop_html = shop_resp.text
             
-            product_id = "18"  # Default fallback
-            # Hanapin ang mga add-to-cart buttons na walang 'product_type_variable' o 'out-of-stock'
+            product_id = "18"
             matches = re.findall(r'data-product_id=["\'](\d+)["\']', shop_html)
             if matches:
                 product_id = matches[0]
@@ -290,10 +289,13 @@ async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: 
                 }
                 plugin_token_json = json.dumps(plugin_token_obj)
             else:
+                err_msg = str(token_data)
+                if isinstance(token_data, dict):
+                    err_msg = token_data.get("error_message") or token_data.get("message") or str(token_data)
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason=f"Tokenization Declined: {str(token_data)[:100]}",
+                    reason=f"Gateway Error: {err_msg[:120]}",
                     latency_ms=elapsed,
                     bin_info=bin_info,
                     card_masked=card_masked,
