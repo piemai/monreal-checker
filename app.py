@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="12.0.0")
+app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="13.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,12 +175,18 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
 
 
 def parse_proxy_string(proxy_url: str) -> dict[str, Any]:
-    """Parses user:pass@host:port or host:port into Playwright and curl_cffi proxy dicts."""
     raw = proxy_url.strip()
     if not raw:
         return {}
     
-    # Extract credentials if present
+    # Handle ThorData host:port:username:password format
+    parts = raw.split(":")
+    if len(parts) == 4 and not "://" in raw:
+        host, port, username, password = parts
+        clean_url = f"http://{host}:{port}"
+        pw_proxy = {"server": clean_url, "username": username, "password": password}
+        return {"server": clean_url, "pw": pw_proxy, "raw": raw}
+
     username, password = None, None
     clean_url = raw
     if "://" in clean_url:
@@ -227,7 +233,7 @@ async def seed_cart_fast(session: AsyncSession, proxy_info: dict[str, Any] | Non
             shop_resp = await session.get(SHOP_URL, timeout=12, proxies=proxies)
             match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
             product_id = (match.group(1) or match.group(2)) if match else "18"
-            cart_resp = await session.post(
+            await session.post(
                 f"{TARGET_BASE}/?wc-ajax=add_to_cart",
                 data={"product_id": product_id, "quantity": "1"},
                 timeout=10,
@@ -357,7 +363,6 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
                 proxy_used=proxy_url,
             )
 
-        # Pass native Playwright proxy configuration dictionary with auth support
         context_opts: dict[str, Any] = {
             "viewport": {"width": 1280, "height": 900},
             "user_agent": (
@@ -604,24 +609,24 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Proxy Checker v12.0</title>
+        <title>Monreal GP-API Proxy Checker v13.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v12.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v13.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Native Playwright Proxy Dict
+                    ThorData Format Supported
                 </span>
             </div>
 
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">
-                        Proxy List (IP:PORT or user:pass@ip:port — optional, one per line or comma-separated)
+                        Proxy List (host:port:user:pass or user:pass@host:port — optional, one per line)
                     </label>
-                    <textarea id="proxyInput" rows="2" placeholder="123.45.67.89:8080"
+                    <textarea id="proxyInput" rows="2" placeholder="86oovvcj.as.thordata.net:9999:username:password"
                         class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
                 </div>
 
@@ -767,3 +772,4 @@ async def checkout_diagnostics(card: str | None = None, proxy: str | None = None
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
+
