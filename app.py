@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="14.0.0")
+app = FastAPI(title="Monreal GP-API Proxy Checker Engine", version="15.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,13 +216,13 @@ async def seed_cart_fast(session: AsyncSession, proxy_info: dict[str, Any] | Non
     try:
         proxies = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
         async with session:
-            shop_resp = await session.get(SHOP_URL, timeout=12, proxies=proxies)
+            shop_resp = await session.get(SHOP_URL, timeout=15, proxies=proxies)
             match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
             product_id = (match.group(1) or match.group(2)) if match else "18"
             await session.post(
                 f"{TARGET_BASE}/?wc-ajax=add_to_cart",
                 data={"product_id": product_id, "quantity": "1"},
-                timeout=10,
+                timeout=12,
                 proxies=proxies,
             )
             return dict(session.cookies)
@@ -273,7 +273,7 @@ async def mint_gpapi_token_direct(
     proxies = {"http": proxy_info["server"], "https": proxy_info["server"]} if proxy_info else None
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
-            resp = await session.post(base_url, headers=headers, json=payload, timeout=10)
+            resp = await session.post(base_url, headers=headers, json=payload, timeout=12)
             data = resp.json()
             if resp.status_code in (200, 201) and isinstance(data, dict) and "id" in data:
                 plugin_token_obj = {
@@ -370,8 +370,9 @@ async def run_hybrid_inspection(card_line: str | None = None, proxy_url: str | N
         ajax_settled = asyncio.Event()
 
         try:
-            await page.goto(CHECKOUT_URL, timeout=25000, wait_until="domcontentloaded")
-            await page.wait_for_selector("#billing_first_name", timeout=25000)
+            # Extended 45s navigation & selector wait timeout for slow proxy routes
+            await page.goto(CHECKOUT_URL, timeout=45000, wait_until="domcontentloaded")
+            await page.wait_for_selector("#billing_first_name", timeout=45000)
 
             billing = BillingProfile.generate()
 
@@ -583,15 +584,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Proxy Checker v14.0</title>
+        <title>Monreal GP-API Proxy Checker v15.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v14.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Proxy Checker v15.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Direct Proxy Route (No Ping Fail)
+                    45s Timeout Buffer
                 </span>
             </div>
 
