@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.hybrid")
 
-app = FastAPI(title="Monreal GP-API Native Engine", version="6.1.0")
+app = FastAPI(title="Monreal GP-API Native Engine", version="6.2.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,18 +384,17 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                     else:
                         debug_info["direct_token_error"] = gp_resp_meta
 
-                # Sniff responses instantly for order success
                 async def on_response(resp):
                     nonlocal response_status, response_reason
                     if "wc-ajax=checkout" in resp.url or "order-received" in resp.url:
                         try:
                             body = await resp.text()
-                            if "result" in body or "order-received" in resp.url:
-                                if '"result":"success"' in body or "order-received" in resp.url:
-                                    response_status = "ORDER_SUCCESS"
-                                    response_reason = f"Captured success response from {resp.url}"
-                                else:
-                                    status_cand, reason_cand = inspect_checkout_response(body)
+                            if '"result":"success"' in body or "order-received" in resp.url:
+                                response_status = "ORDER_SUCCESS"
+                                response_reason = f"Order successfully placed -> {resp.url}"
+                            else:
+                                status_cand, reason_cand = inspect_checkout_response(body)
+                                if status_cand == "ORDER_SUCCESS":
                                     response_status = status_cand
                                     response_reason = reason_cand
                         except Exception:
@@ -430,21 +429,35 @@ async def run_hybrid_inspection(card_line: str | None = None) -> DiagnosticResul
                         if (window.globalpayments_gpapi) {
                             window.globalpayments_gpapi.tokenResponse = tokenStr;
                         }
+
+                        const placeBtn = document.querySelector('#place_order, button[name="woocommerce_checkout_place_order"]');
+                        if (placeBtn) {
+                            placeBtn.disabled = false;
+                            placeBtn.classList.remove('disabled');
+                        }
                     }""", captured_token)
 
+                    # Force click place order using Playwright locator with multiple fallbacks
                     place_btn = page.locator("#place_order, button[name='woocommerce_checkout_place_order']").first
                     if await place_btn.count() > 0:
                         try:
-                            await place_btn.click(force=True, timeout=5000)
+                            await place_btn.click(force=True, timeout=3000)
                         except Exception:
                             pass
 
-                    # Poll for order success or confirmation URL
+                    # Also fire jQuery trigger submit directly
+                    await page.evaluate("""() => {
+                        if (window.jQuery) {
+                            window.jQuery('form.checkout').trigger('submit');
+                        }
+                    }""")
+
+                    # Wait up to 35 seconds for success render or redirect
                     for _ in range(35):
                         await page.wait_for_timeout(1000)
                         if "order-received" in page.url or response_status == "ORDER_SUCCESS":
                             response_status = "ORDER_SUCCESS"
-                            response_reason = f"Order confirmed -> {page.url}"
+                            response_reason = f"Confirmed order success -> {page.url}"
                             break
 
             elapsed = (time.perf_counter() - started) * 1000
@@ -486,15 +499,15 @@ async def index() -> HTMLResponse:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal Direct GP-API Engine v6.1</title>
+        <title>Monreal Direct GP-API Engine v6.2</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-xl mx-auto space-y-6">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v6.1</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Direct Tokenizer v6.2</h1>
             <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-lg border border-slate-800">
                 <p class="text-slate-400 text-sm">
-                    Network-sniffing success capture engine with robust order-received detection.
+                    Forces button enablement, triggers click and jQuery form submit, captures success.
                 </p>
                 <div>
                     <label class="block text-xs font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
@@ -516,8 +529,8 @@ async def index() -> HTMLResponse:
             const output = document.getElementById("output");
             const card = document.getElementById("cardInput").value;
             button.disabled = true;
-            button.textContent = "Executing v6.1 network-sniffing charge...";
-            output.textContent = "Minting token, injecting inputs, sniffing network responses for success...";
+            button.textContent = "Executing v6.2 force-trigger charge...";
+            output.textContent = "Minting token, injecting DOM inputs, forcing click & submit triggers...";
             try {
                 let url = "/api/diagnostics/checkout";
                 if (card && card.trim()) url += "?card=" + encodeURIComponent(card.trim());
