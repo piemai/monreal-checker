@@ -26,8 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="54.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="55.0.0")
 
+# V53 Reference Core na may nakalagay na fail-safe memory slot para hindi maubusan ng token
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
     "access_token": os.getenv("GP_ACCESS_TOKEN", "ILDALAN_MO_DITO_YUNG_TOTOO_MONG_LIVE_TOKEN"),
     "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
@@ -269,11 +270,12 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             gp_env = env_match.group(1) if env_match else "production"
 
+            # V53 Core Hybrid Fail-Safe
             if access_token and len(html_content) >= 130000:
                 GLOBAL_TOKEN_MEMORY["access_token"] = access_token
                 if checkout_nonce:
                     GLOBAL_TOKEN_MEMORY["checkout_nonce"] = checkout_nonce
-                debug_info["token_source"] = "v48_live_scrape"
+                debug_info["token_source"] = "v53_live_scrape"
             else:
                 access_token = GLOBAL_TOKEN_MEMORY["access_token"]
                 debug_info["token_source"] = "hardcoded_fail_safe_memory"
@@ -289,7 +291,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract access token. Please set GP_ACCESS_TOKEN or update GLOBAL_TOKEN_MEMORY.",
+                    reason="Failed to extract access token. Please update GLOBAL_TOKEN_MEMORY with your live merchant token.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -439,15 +441,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API SSL-Bypassed Checker v54.0</title>
+    <title>Monreal GP-API V53 Reference Auto-Prune Checker v55.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API SSL-Bypassed Checker v54.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API V53 Reference Auto-Prune Checker v55.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                SSL Verify False v54.0
+                V53 Core + Auto-Prune v55.0
             </span>
         </div>
 
