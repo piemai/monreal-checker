@@ -228,10 +228,17 @@ async def run_full_checkout_inspection(card_line: str | None = None, proxy_url: 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers, verify=False) as session:
             await session.get(TARGET_BASE, timeout=8)
-            shop_resp = await session.get(SHOP_URL, timeout=10)
-            match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-            product_id = (match.group(1) or match.group(2)) if match else "18"
             
+            # Smart Product Finder: Maghanap ng kahit anong in-stock product sa shop page
+            shop_resp = await session.get(SHOP_URL, timeout=10)
+            shop_html = shop_resp.text
+            
+            product_id = "18"  # Default fallback
+            # Hanapin ang mga add-to-cart buttons na walang 'product_type_variable' o 'out-of-stock'
+            matches = re.findall(r'data-product_id=["\'](\d+)["\']', shop_html)
+            if matches:
+                product_id = matches[0]
+
             await session.post(
                 f"{TARGET_BASE}/?wc-ajax=add_to_cart",
                 data={"product_id": product_id, "quantity": "1"},
